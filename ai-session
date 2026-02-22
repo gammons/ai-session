@@ -73,7 +73,7 @@ git_author() {
 claude_project_key() {
   local toplevel
   toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  printf '%s' "$toplevel" | sed 's|/|-|g'
+  printf '%s' "$toplevel" | sed 's|[^a-zA-Z0-9-]|-|g'
 }
 
 # Find most recent JSONL in Claude projects dir
@@ -225,7 +225,7 @@ _install_claude_hook() {
       .hooks //= {} |
       .hooks.PostToolUse //= [] |
       .hooks.PostToolUse = [.hooks.PostToolUse[] | select(.command? != "ai-session _mark-active")] |
-      .hooks.PostToolUse += [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "ai-session _mark-active"}]}]
+      .hooks.PostToolUse += [{"matcher": "Edit|Write|Bash|NotebookEdit", "hooks": [{"type": "command", "command": "ai-session _mark-active"}]}]
     ' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
   else
     cat > "$settings_file" << 'EOF'
@@ -233,7 +233,7 @@ _install_claude_hook() {
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit|Write",
+        "matcher": "Edit|Write|Bash|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "ai-session _mark-active" }
         ]
