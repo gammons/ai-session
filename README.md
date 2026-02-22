@@ -2,7 +2,7 @@
 
 **Persist Claude Code conversation transcripts as git artifacts, linked bidirectionally to commits and PRs.**
 
-Every time you use Claude Code to write code and then `git commit`, the conversation that produced that code is automatically captured — stored right in your repo, traceable from the commit, and surfaced on your pull request.
+Every time you use Claude Code to write code and then `git commit`, the conversation that produced that code is automatically captured + stored right in your repo, traceable from the commit, and surfaced on your pull request.
 
 No extra steps. No copy-pasting. Just `claude`, `git commit`, `git push`.
 
@@ -76,7 +76,7 @@ git add .ai .claude/settings.json
 git commit -m "Set up ai-session"
 ```
 
-This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`. Committing `.ai/` and `.claude/settings.json` means teammates get the session history and the Claude Code hook config automatically — no need for everyone to run `init`.
+This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`. Committing `.ai/` and `.claude/settings.json` means teammates get the session history and the Claude Code hook config automatically.
 
 ### Use it
 
