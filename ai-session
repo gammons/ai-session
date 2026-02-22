@@ -1,0 +1,781 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ai-session — Persist Claude Code conversation transcripts as git artifacts
+# Usage: ai-session <command> [options]
+
+VERSION="0.1.0"
+AI_DIR=".ai"
+SESSIONS_DIR="$AI_DIR/sessions"
+BREADCRUMB="$AI_DIR/.active-session"
+STALE_HOURS=2
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { printf 'error: %s\n' "$1" >&2; exit 1; }
+info() { printf '%s\n' "$1" >&2; }
+
+slugify() {
+  # kebab-case, truncate to 40 chars
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+    | cut -c1-40
+}
+
+short_id() {
+  printf '%s' "$1" | cut -c1-8
+}
+
+now_iso() {
+  date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+now_folder_prefix() {
+  date -u '+%Y-%m-%d_%H%MZ'
+}
+
+gen_uuid() {
+  if command -v uuidgen &>/dev/null; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+
+file_age_hours() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    echo 9999
+    return
+  fi
+  local now file_epoch
+  now=$(date +%s)
+  file_epoch=$(stat -c '%Y' "$file" 2>/dev/null || stat -f '%m' "$file" 2>/dev/null)
+  echo $(( (now - file_epoch) / 3600 ))
+}
+
+repo_name() {
+  basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+}
+
+current_branch() {
+  git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "unknown"
+}
+
+git_author() {
+  git config user.name 2>/dev/null || echo "unknown"
+}
+
+# Derive Claude Code project key from pwd
+claude_project_key() {
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  printf '%s' "$toplevel" | sed 's|/|-|g'
+}
+
+# Find most recent JSONL in Claude projects dir
+find_latest_jsonl() {
+  local key="$1"
+  local projects_dir="$HOME/.claude/projects/$key"
+  if [[ ! -d "$projects_dir" ]]; then
+    return 1
+  fi
+  # Find most recently modified .jsonl
+  find "$projects_dir" -maxdepth 1 -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null \
+    | sort -rn | head -1 | cut -f2
+}
+
+# Convert JSONL transcript to Markdown
+jsonl_to_markdown() {
+  local jsonl_path="$1"
+  jq -r '
+    if .type == "human" then
+      "\n## User\n\n" + (
+        if (.message | type) == "array" then
+          [.message[] | select(.type == "text") | .text] | join("\n")
+        elif (.message | type) == "object" and .message.content then
+          if (.message.content | type) == "array" then
+            [.message.content[] | select(.type == "text") | .text] | join("\n")
+          else
+            (.message.content // "")
+          end
+        elif (.message | type) == "string" then
+          .message
+        else
+          ""
+        end
+      )
+    elif .type == "assistant" then
+      "\n## Assistant\n\n" + (
+        if (.message | type) == "object" and .message.content then
+          if (.message.content | type) == "array" then
+            [.message.content[] | select(.type == "text") | .text] | join("\n")
+          else
+            (.message.content // "")
+          end
+        elif (.message | type) == "string" then
+          .message
+        else
+          ""
+        end
+      )
+    else
+      empty
+    end
+  ' "$jsonl_path" 2>/dev/null || true
+}
+
+# Compute sha256 hash of a file
+file_sha256() {
+  if command -v sha256sum &>/dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum &>/dev/null; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    echo "unknown"
+  fi
+}
+
+# Read a trailer value from git commit message
+get_trailer() {
+  local commit="$1" trailer="$2"
+  git log -1 --format='%(trailers:key='"$trailer"',valueonly)' "$commit" 2>/dev/null | head -1
+}
+
+# ─── Subcommands ──────────────────────────────────────────────────────────────
+
+cmd_init() {
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+  cd "$toplevel"
+
+  # Create .ai directory structure
+  mkdir -p "$SESSIONS_DIR"
+
+  # Create .ai/.gitignore
+  cat > "$AI_DIR/.gitignore" << 'EOF'
+.active-session
+EOF
+
+  # Install git hooks
+  local hooks_dir="$toplevel/.git/hooks"
+  mkdir -p "$hooks_dir"
+
+  _install_hook "$hooks_dir/prepare-commit-msg" "_hook_prepare_commit_msg" \
+    'ai-session _hook-prepare-commit-msg "$@"'
+
+  _install_hook "$hooks_dir/post-commit" "_hook_post_commit" \
+    'ai-session _hook-post-commit'
+
+  _install_hook "$hooks_dir/pre-push" "_hook_pre_push" \
+    'ai-session _hook-pre-push "$@"'
+
+  # Add Claude Code hook to .claude/settings.json
+  _install_claude_hook "$toplevel"
+
+  info "ai-session: initialized in $toplevel"
+  info "  .ai/ directory created"
+  info "  git hooks installed (prepare-commit-msg, post-commit, pre-push)"
+  info "  Claude Code hook added to .claude/settings.json"
+}
+
+_install_hook() {
+  local hook_file="$1" marker="$2" command="$3"
+
+  if [[ -f "$hook_file" ]]; then
+    # Check if already installed
+    if grep -q "$marker" "$hook_file" 2>/dev/null; then
+      return 0
+    fi
+    # Append to existing hook
+    cat >> "$hook_file" << EOF
+
+# ai-session: $marker
+$command
+EOF
+  else
+    cat > "$hook_file" << EOF
+#!/usr/bin/env bash
+# ai-session: $marker
+$command
+EOF
+  fi
+  chmod +x "$hook_file"
+}
+
+_install_claude_hook() {
+  local toplevel="$1"
+  local settings_dir="$toplevel/.claude"
+  local settings_file="$settings_dir/settings.json"
+
+  mkdir -p "$settings_dir"
+
+  if [[ -f "$settings_file" ]]; then
+    # Check if hook already exists
+    if jq -e '.hooks.PostToolUse[]? | select(.command == "ai-session _mark-active")' "$settings_file" &>/dev/null; then
+      return 0
+    fi
+    # Merge hook into existing settings
+    local tmp
+    tmp=$(mktemp)
+    jq '
+      .hooks //= {} |
+      .hooks.PostToolUse //= [] |
+      .hooks.PostToolUse += [{"matcher": "Edit|Write", "command": "ai-session _mark-active"}]
+    ' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+  else
+    cat > "$settings_file" << 'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "command": "ai-session _mark-active"
+      }
+    ]
+  }
+}
+EOF
+  fi
+}
+
+cmd_new() {
+  local goal="" transcript_path="" from_stdin=false auto_detect=false
+  local model="" author="" commit_mode="" repo_path=""
+  local -a links=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --goal)       goal="$2"; shift 2 ;;
+      --transcript) transcript_path="$2"; shift 2 ;;
+      --stdin)      from_stdin=true; shift ;;
+      --auto)       auto_detect=true; shift ;;
+      --model)      model="$2"; shift 2 ;;
+      --author)     author="$2"; shift 2 ;;
+      --link)       links+=("$2"); shift 2 ;;
+      --commit)     commit_mode="commit"; shift ;;
+      --amend)      commit_mode="amend"; shift ;;
+      --repo)       repo_path="$2"; shift 2 ;;
+      *)            die "unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$goal" ]] || die "missing --goal"
+
+  local session_id claude_session_id=""
+  local slug prefix folder_name session_dir
+
+  # Read breadcrumb if available
+  if [[ -f "$BREADCRUMB" ]]; then
+    claude_session_id=$(jq -r '.session_id // empty' "$BREADCRUMB" 2>/dev/null || true)
+    [[ -z "$model" ]] && model=$(jq -r '.model // empty' "$BREADCRUMB" 2>/dev/null || true)
+  fi
+
+  # Generate session ID
+  if [[ -n "$claude_session_id" ]]; then
+    session_id="$claude_session_id"
+  else
+    session_id=$(gen_uuid)
+  fi
+
+  local sid
+  sid=$(short_id "$session_id")
+  slug=$(slugify "$goal")
+  prefix=$(now_folder_prefix)
+  folder_name="${prefix}_${slug}__${sid}"
+
+  # Determine target directory
+  local base_dir
+  if [[ -n "$repo_path" ]]; then
+    base_dir="$repo_path"
+  else
+    base_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  fi
+  session_dir="$base_dir/$SESSIONS_DIR/$folder_name"
+  mkdir -p "$session_dir"
+
+  # Handle transcript
+  local transcript_hash=""
+  if [[ "$auto_detect" == true ]]; then
+    local key jsonl_src
+    key=$(claude_project_key)
+    jsonl_src=$(find_latest_jsonl "$key" || true)
+    if [[ -n "$jsonl_src" ]]; then
+      cp "$jsonl_src" "$session_dir/transcript.jsonl"
+      jsonl_to_markdown "$session_dir/transcript.jsonl" > "$session_dir/transcript.md"
+      transcript_hash="sha256:$(file_sha256 "$session_dir/transcript.jsonl")"
+      # Derive model from JSONL if not set
+      if [[ -z "$model" ]]; then
+        model=$(jq -r 'select(.model) | .model' "$session_dir/transcript.jsonl" 2>/dev/null | head -1 || true)
+      fi
+    fi
+  elif [[ "$from_stdin" == true ]]; then
+    cat > "$session_dir/transcript.md"
+    transcript_hash="sha256:$(file_sha256 "$session_dir/transcript.md")"
+  elif [[ -n "$transcript_path" ]]; then
+    cp "$transcript_path" "$session_dir/"
+    local basename_t
+    basename_t=$(basename "$transcript_path")
+    transcript_hash="sha256:$(file_sha256 "$session_dir/$basename_t")"
+  fi
+
+  [[ -z "$author" ]] && author=$(git_author)
+  [[ -z "$model" ]] && model="unknown"
+
+  # Build links JSON array
+  local links_json="[]"
+  if [[ ${#links[@]} -gt 0 ]]; then
+    links_json=$(printf '%s\n' "${links[@]}" | jq -R . | jq -s .)
+  fi
+
+  # Write meta.json
+  jq -n \
+    --arg session_id "$session_id" \
+    --arg short_id "$sid" \
+    --arg created_at "$(now_iso)" \
+    --arg author "$author" \
+    --arg repo "$(repo_name)" \
+    --arg branch "$(current_branch)" \
+    --arg goal "$goal" \
+    --arg model "$model" \
+    --argjson links "$links_json" \
+    --arg claude_session_id "$claude_session_id" \
+    --arg transcript_hash "$transcript_hash" \
+    '{
+      session_id: $session_id,
+      short_id: $short_id,
+      created_at: $created_at,
+      author: $author,
+      repo: $repo,
+      branch: $branch,
+      goal: $goal,
+      model: $model,
+      links: $links,
+      commits: [],
+      pr: null,
+      claude_session_id: (if $claude_session_id == "" then null else $claude_session_id end),
+      transcript_hash: (if $transcript_hash == "" then null else $transcript_hash end)
+    }' > "$session_dir/meta.json"
+
+  # Handle commit/amend mode
+  if [[ "$commit_mode" == "commit" ]]; then
+    git add "$session_dir"
+    git commit -m "ai-session: $goal" \
+      --trailer "Claude-Session: $sid" \
+      --trailer "Claude-Session-Path: $SESSIONS_DIR/$folder_name"
+  elif [[ "$commit_mode" == "amend" ]]; then
+    git add "$session_dir"
+    git commit --amend --no-edit \
+      --trailer "Claude-Session: $sid" \
+      --trailer "Claude-Session-Path: $SESSIONS_DIR/$folder_name"
+  fi
+
+  # Output the folder name for callers
+  echo "$SESSIONS_DIR/$folder_name"
+}
+
+cmd_attach() {
+  [[ $# -ge 2 ]] || die "usage: ai-session attach <short-id> <sha>..."
+
+  local target_id="$1"; shift
+  local -a shas=("$@")
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  # Find session directory by short-id
+  local session_dir=""
+  for d in "$toplevel/$SESSIONS_DIR"/*"__${target_id}"/; do
+    if [[ -d "$d" ]]; then
+      session_dir="$d"
+      break
+    fi
+  done
+  [[ -n "$session_dir" ]] || die "session not found: $target_id"
+
+  local meta="$session_dir/meta.json"
+  [[ -f "$meta" ]] || die "meta.json not found in $session_dir"
+
+  # Add commits to meta.json
+  local tmp
+  tmp=$(mktemp)
+  jq --argjson new_commits "$(printf '%s\n' "${shas[@]}" | jq -R . | jq -s .)" \
+    '.commits = (.commits + $new_commits | unique)' "$meta" > "$tmp" && mv "$tmp" "$meta"
+
+  info "attached ${#shas[@]} commit(s) to session $target_id"
+}
+
+cmd_pr() {
+  local -a session_ids=()
+  local pr_number=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pr) pr_number="$2"; shift 2 ;;
+      *)    session_ids+=("$1"); shift ;;
+    esac
+  done
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  # If no PR specified, try current branch
+  if [[ -z "$pr_number" ]]; then
+    pr_number=$(gh pr view --json number -q '.number' 2>/dev/null || true)
+    [[ -n "$pr_number" ]] || die "no open PR found for current branch; use --pr <number>"
+  fi
+
+  local pr_url
+  pr_url=$(gh pr view "$pr_number" --json url -q '.url' 2>/dev/null) || die "cannot find PR #$pr_number"
+
+  # If no session IDs, scan commits on this branch vs base
+  if [[ ${#session_ids[@]} -eq 0 ]]; then
+    local base
+    base=$(gh pr view "$pr_number" --json baseRefName -q '.baseRefName' 2>/dev/null || echo "main")
+    while IFS= read -r sid; do
+      [[ -n "$sid" ]] && session_ids+=("$sid")
+    done < <(git log "$base"..HEAD --format='%(trailers:key=Claude-Session,valueonly)' 2>/dev/null | grep -v '^$' | sort -u)
+  fi
+
+  [[ ${#session_ids[@]} -gt 0 ]] || { info "no sessions found to link"; return 0; }
+
+  # Update each session's meta.json with PR link
+  for sid in "${session_ids[@]}"; do
+    for d in "$toplevel/$SESSIONS_DIR"/*"__${sid}"/; do
+      if [[ -d "$d" && -f "$d/meta.json" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        jq --arg pr "$pr_url" '.pr = $pr' "$d/meta.json" > "$tmp" && mv "$tmp" "$d/meta.json"
+      fi
+    done
+  done
+
+  # Build AI Sessions table for PR body
+  local table
+  table=$(_build_pr_table "$toplevel" "${session_ids[@]}")
+
+  # Update PR body
+  local current_body
+  current_body=$(gh pr view "$pr_number" --json body -q '.body' 2>/dev/null || echo "")
+
+  local marker_start="<!-- ai-sessions-start -->"
+  local marker_end="<!-- ai-sessions-end -->"
+  local new_section
+  new_section=$(printf '%s\n\n%s\n\n%s' "$marker_start" "$table" "$marker_end")
+
+  local new_body
+  if echo "$current_body" | grep -q "$marker_start"; then
+    # Replace existing section
+    new_body=$(echo "$current_body" | sed "/$marker_start/,/$marker_end/c\\
+$new_section")
+  else
+    # Append section
+    new_body=$(printf '%s\n\n---\n\n%s' "$current_body" "$new_section")
+  fi
+
+  gh pr edit "$pr_number" --body "$new_body"
+  info "updated PR #$pr_number with ${#session_ids[@]} session(s)"
+}
+
+_build_pr_table() {
+  local toplevel="$1"; shift
+  local -a sids=("$@")
+
+  echo "### AI Sessions"
+  echo ""
+  echo "| Session | Goal | Model | Commits |"
+  echo "|---------|------|-------|---------|"
+
+  for sid in "${sids[@]}"; do
+    for d in "$toplevel/$SESSIONS_DIR"/*"__${sid}"/; do
+      if [[ -d "$d" && -f "$d/meta.json" ]]; then
+        local goal model commits_str
+        goal=$(jq -r '.goal' "$d/meta.json")
+        model=$(jq -r '.model' "$d/meta.json")
+        commits_str=$(jq -r '.commits | map(.[0:7]) | join(", ")' "$d/meta.json")
+        local rel_path="${d#$toplevel/}"
+        echo "| [\`$sid\`]($rel_path) | $goal | $model | $commits_str |"
+      fi
+    done
+  done
+}
+
+cmd_list() {
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  local found=false
+  for meta in "$toplevel/$SESSIONS_DIR"/*/meta.json; do
+    [[ -f "$meta" ]] || continue
+    found=true
+    local sid goal created model
+    sid=$(jq -r '.short_id' "$meta")
+    goal=$(jq -r '.goal' "$meta")
+    created=$(jq -r '.created_at' "$meta")
+    model=$(jq -r '.model' "$meta")
+    printf '%-10s %-20s %-20s %s\n' "$sid" "$created" "$model" "$goal"
+  done
+
+  if [[ "$found" == false ]]; then
+    info "no sessions found"
+  fi
+}
+
+cmd_show() {
+  [[ $# -ge 1 ]] || die "usage: ai-session show <short-id>"
+  local target_id="$1"
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  for d in "$toplevel/$SESSIONS_DIR"/*"__${target_id}"/; do
+    if [[ -d "$d" && -f "$d/meta.json" ]]; then
+      jq . "$d/meta.json"
+      return 0
+    fi
+  done
+
+  die "session not found: $target_id"
+}
+
+cmd_resume() {
+  [[ $# -ge 1 ]] || die "usage: ai-session resume <sha|--pr N>"
+
+  local target="$1"
+  local session_path=""
+
+  if [[ "$target" == "--pr" ]]; then
+    [[ $# -ge 2 ]] || die "usage: ai-session resume --pr <number>"
+    local pr_num="$2"
+    # Find commits from PR, look for session trailers
+    local sha
+    sha=$(gh pr view "$pr_num" --json commits -q '.commits[-1].oid' 2>/dev/null) || die "cannot read PR #$pr_num"
+    session_path=$(get_trailer "$sha" "Claude-Session-Path")
+  else
+    # Treat as a commit SHA (or ref like HEAD)
+    session_path=$(get_trailer "$target" "Claude-Session-Path")
+  fi
+
+  [[ -n "$session_path" ]] || die "no Claude-Session-Path trailer found"
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+
+  local full_path="$toplevel/$session_path"
+  [[ -d "$full_path" ]] || die "session directory not found: $full_path"
+
+  local meta="$full_path/meta.json"
+  [[ -f "$meta" ]] || die "meta.json not found"
+
+  local claude_sid
+  claude_sid=$(jq -r '.claude_session_id // empty' "$meta")
+
+  info "session: $(jq -r '.short_id' "$meta")"
+  info "goal:    $(jq -r '.goal' "$meta")"
+  info "model:   $(jq -r '.model' "$meta")"
+
+  if [[ -n "$claude_sid" ]]; then
+    info "resuming Claude Code session: $claude_sid"
+    exec claude --resume "$claude_sid"
+  else
+    info "no Claude session ID available; launching new session with transcript context"
+    if [[ -f "$full_path/transcript.md" ]]; then
+      exec claude --prompt "Previous session transcript is at: $full_path/transcript.md"
+    else
+      exec claude
+    fi
+  fi
+}
+
+cmd_mark_active() {
+  # Internal: write breadcrumb file
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  cd "$toplevel"
+
+  mkdir -p "$AI_DIR"
+
+  local session_id model timestamp
+  session_id="${CLAUDE_SESSION_ID:-$(gen_uuid)}"
+  model="${CLAUDE_MODEL:-unknown}"
+  timestamp=$(now_iso)
+
+  jq -n \
+    --arg session_id "$session_id" \
+    --arg timestamp "$timestamp" \
+    --arg model "$model" \
+    '{session_id: $session_id, timestamp: $timestamp, model: $model}' \
+    > "$BREADCRUMB"
+}
+
+# ─── Hook Subcommands ────────────────────────────────────────────────────────
+
+cmd_hook_prepare_commit_msg() {
+  local msg_file="${1:-}"
+  local commit_source="${2:-}"
+  local commit_sha="${3:-}"
+
+  # Skip for merge/squash/amend commits
+  [[ "$commit_source" == "merge" || "$commit_source" == "squash" ]] && return 0
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  cd "$toplevel"
+
+  # Check breadcrumb
+  [[ -f "$BREADCRUMB" ]] || return 0
+
+  local age
+  age=$(file_age_hours "$BREADCRUMB")
+  (( age < STALE_HOURS )) || { rm -f "$BREADCRUMB"; return 0; }
+
+  # Read first line of commit message as goal
+  local first_line
+  first_line=$(head -1 "$msg_file" | sed 's/^#.*//; s/^[[:space:]]*//' || true)
+  [[ -n "$first_line" ]] || return 0
+
+  # Create session
+  local session_path
+  session_path=$(cmd_new --goal "$first_line" --auto 2>/dev/null) || return 0
+
+  # Read short_id from the created meta.json
+  local sid
+  sid=$(jq -r '.short_id' "$toplevel/$session_path/meta.json" 2>/dev/null || true)
+  [[ -n "$sid" ]] || return 0
+
+  # Stage session files
+  git add "$session_path" 2>/dev/null || true
+
+  # Append trailers to commit message
+  # Use git interpret-trailers for proper formatting
+  local tmp
+  tmp=$(mktemp)
+  git interpret-trailers \
+    --trailer "Claude-Session: $sid" \
+    --trailer "Claude-Session-Path: $session_path" \
+    --in-place "$msg_file" 2>/dev/null || {
+    # Fallback: manually append
+    printf '\n\nClaude-Session: %s\nClaude-Session-Path: %s\n' "$sid" "$session_path" >> "$msg_file"
+  }
+
+  # Remove breadcrumb
+  rm -f "$BREADCRUMB"
+}
+
+cmd_hook_post_commit() {
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  cd "$toplevel"
+
+  local session_path
+  session_path=$(get_trailer HEAD "Claude-Session-Path")
+  [[ -n "$session_path" ]] || return 0
+
+  local meta="$toplevel/$session_path/meta.json"
+  [[ -f "$meta" ]] || return 0
+
+  local commit_sha
+  commit_sha=$(git rev-parse --short HEAD)
+
+  # Backfill commit SHA into meta.json (dirty write, no amend)
+  local tmp
+  tmp=$(mktemp)
+  jq --arg sha "$commit_sha" '.commits = (.commits + [$sha] | unique)' "$meta" > "$tmp" && mv "$tmp" "$meta"
+}
+
+cmd_hook_pre_push() {
+  local remote="${1:-origin}"
+  local url="${2:-}"
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  cd "$toplevel"
+
+  # Collect session IDs from commits being pushed
+  local -a session_ids=()
+
+  # Read stdin for refs being pushed
+  while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+    [[ "$local_sha" == "0000000000000000000000000000000000000000" ]] && continue
+
+    local range
+    if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+      range="$local_sha"
+    else
+      range="$remote_sha..$local_sha"
+    fi
+
+    while IFS= read -r sid; do
+      [[ -n "$sid" ]] && session_ids+=("$sid")
+    done < <(git log "$range" --format='%(trailers:key=Claude-Session,valueonly)' 2>/dev/null | grep -v '^$' | sort -u)
+  done
+
+  [[ ${#session_ids[@]} -gt 0 ]] || return 0
+
+  # Check if current branch has an open PR
+  local pr_number
+  pr_number=$(gh pr view --json number -q '.number' 2>/dev/null || true)
+  [[ -n "$pr_number" ]] || return 0
+
+  # Auto-update PR body
+  cmd_pr "${session_ids[@]}" --pr "$pr_number" 2>/dev/null || true
+}
+
+# ─── Main Dispatch ────────────────────────────────────────────────────────────
+
+cmd_help() {
+  cat << 'EOF'
+ai-session — Persist Claude Code conversation transcripts as git artifacts
+
+Usage: ai-session <command> [options]
+
+Commands:
+  init                Set up hooks + .ai/ directory in current repo
+  new                 Create a new session
+  attach <id> <sha>   Link session to commit(s)
+  pr [<id>...] --pr N Link sessions to PR + update PR body
+  list                List all sessions
+  show <id>           Print session metadata
+  resume <sha|--pr N> Launch Claude Code with linked session
+  _mark-active        Internal: write breadcrumb (Claude Code hook)
+
+new flags:
+  --goal "..."        Summary (required)
+  --transcript <path> Transcript file path
+  --stdin             Read transcript from stdin
+  --auto              Auto-detect latest Claude Code session
+  --model <name>      Model name
+  --author <name>     Author (default: git user.name)
+  --link <url>        Arbitrary URL (repeatable)
+  --commit            Stage + commit with trailers
+  --amend             Amend last commit with trailers
+  --repo <path>       External ai-log repo
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    init)                    cmd_init "$@" ;;
+    new)                     cmd_new "$@" ;;
+    attach)                  cmd_attach "$@" ;;
+    pr)                      cmd_pr "$@" ;;
+    list)                    cmd_list "$@" ;;
+    show)                    cmd_show "$@" ;;
+    resume)                  cmd_resume "$@" ;;
+    _mark-active)            cmd_mark_active "$@" ;;
+    _hook-prepare-commit-msg) cmd_hook_prepare_commit_msg "$@" ;;
+    _hook-post-commit)       cmd_hook_post_commit "$@" ;;
+    _hook-pre-push)          cmd_hook_pre_push "$@" ;;
+    help|--help|-h)          cmd_help ;;
+    version|--version|-v)    echo "ai-session $VERSION" ;;
+    *)                       die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
