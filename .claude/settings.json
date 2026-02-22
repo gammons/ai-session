@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|Bash|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "ai-session _mark-active" }
+        ]
+      }
+    ]
+  }
+}
