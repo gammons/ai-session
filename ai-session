@@ -545,10 +545,13 @@ cmd_show() {
 }
 
 cmd_resume() {
-  [[ $# -ge 1 ]] || die "usage: ai-session resume <sha|--pr N>"
+  [[ $# -ge 1 ]] || die "usage: ai-session resume <id|sha|--pr N>"
 
   local target="$1"
   local session_path=""
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
 
   if [[ "$target" == "--pr" ]]; then
     [[ $# -ge 2 ]] || die "usage: ai-session resume --pr <number>"
@@ -558,14 +561,23 @@ cmd_resume() {
     sha=$(gh pr view "$pr_num" --json commits -q '.commits[-1].oid' 2>/dev/null) || die "cannot read PR #$pr_num"
     session_path=$(get_trailer "$sha" "Claude-Session-Path")
   else
-    # Treat as a commit SHA (or ref like HEAD)
-    session_path=$(get_trailer "$target" "Claude-Session-Path")
+    # First, try as a session short ID (look for matching folder)
+    for d in "$toplevel/$SESSIONS_DIR"/*"__${target}"/; do
+      if [[ -d "$d" ]]; then
+        session_path="${d#$toplevel/}"
+        # Remove trailing slash
+        session_path="${session_path%/}"
+        break
+      fi
+    done
+
+    # If not found as session ID, try as a commit SHA/ref
+    if [[ -z "$session_path" ]]; then
+      session_path=$(get_trailer "$target" "Claude-Session-Path")
+    fi
   fi
 
-  [[ -n "$session_path" ]] || die "no Claude-Session-Path trailer found"
-
-  local toplevel
-  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+  [[ -n "$session_path" ]] || die "no session found for: $target"
 
   local full_path="$toplevel/$session_path"
   [[ -d "$full_path" ]] || die "session directory not found: $full_path"
@@ -763,7 +775,7 @@ Commands:
   pr [<id>...] --pr N Link sessions to PR + update PR body
   list                List all sessions
   show <id>           Print session metadata
-  resume <sha|--pr N> Launch Claude Code with linked session
+  resume <id|sha|--pr N> Launch Claude Code with linked session
   _mark-active        Internal: write breadcrumb (Claude Code hook)
 
 new flags:
