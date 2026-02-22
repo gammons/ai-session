@@ -72,9 +72,11 @@ export PATH="$PWD/ai-session:$PATH"  # add to .bashrc/.zshrc
 ```bash
 cd your-project
 ai-session init
+git add .ai .claude/settings.json
+git commit -m "Set up ai-session"
 ```
 
-This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`.
+This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`. Committing `.ai/` and `.claude/settings.json` means teammates get the session history and the Claude Code hook config automatically — no need for everyone to run `init`.
 
 ### Use it
 

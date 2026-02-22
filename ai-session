@@ -215,16 +215,17 @@ _install_claude_hook() {
 
   if [[ -f "$settings_file" ]]; then
     # Check if hook already exists
-    if jq -e '.hooks.PostToolUse[]? | select(.command == "ai-session _mark-active")' "$settings_file" &>/dev/null; then
+    if jq -e '.hooks.PostToolUse[]? | .hooks[]? | select(.command == "ai-session _mark-active")' "$settings_file" &>/dev/null; then
       return 0
     fi
-    # Merge hook into existing settings
+    # Remove any old-format ai-session entries (flat command field, no hooks array)
     local tmp
     tmp=$(mktemp)
     jq '
       .hooks //= {} |
       .hooks.PostToolUse //= [] |
-      .hooks.PostToolUse += [{"matcher": "Edit|Write", "command": "ai-session _mark-active"}]
+      .hooks.PostToolUse = [.hooks.PostToolUse[] | select(.command? != "ai-session _mark-active")] |
+      .hooks.PostToolUse += [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "ai-session _mark-active"}]}]
     ' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
   else
     cat > "$settings_file" << 'EOF'
@@ -233,7 +234,9 @@ _install_claude_hook() {
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
-        "command": "ai-session _mark-active"
+        "hooks": [
+          { "type": "command", "command": "ai-session _mark-active" }
+        ]
       }
     ]
   }
@@ -592,16 +595,37 @@ cmd_resume() {
 
 cmd_mark_active() {
   # Internal: write breadcrumb file
+  # Called by Claude Code PostToolUse hook; receives JSON on stdin
   local toplevel
   toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   cd "$toplevel"
 
   mkdir -p "$AI_DIR"
 
+  # Read JSON from stdin (Claude Code hook input)
+  local stdin_json=""
+  if ! [ -t 0 ]; then
+    stdin_json=$(cat)
+  fi
+
   local session_id model timestamp
-  session_id="${CLAUDE_SESSION_ID:-$(gen_uuid)}"
-  model="${CLAUDE_MODEL:-unknown}"
   timestamp=$(now_iso)
+
+  # Extract session_id from hook input, env var, or generate one
+  session_id=$(echo "$stdin_json" | jq -r '.session_id // empty' 2>/dev/null || true)
+  [[ -z "$session_id" ]] && session_id="${CLAUDE_SESSION_ID:-$(gen_uuid)}"
+
+  model="${CLAUDE_MODEL:-unknown}"
+
+  # If breadcrumb already exists with the same session, just touch it
+  if [[ -f "$BREADCRUMB" ]]; then
+    local existing_sid
+    existing_sid=$(jq -r '.session_id // empty' "$BREADCRUMB" 2>/dev/null || true)
+    if [[ "$existing_sid" == "$session_id" ]]; then
+      touch "$BREADCRUMB"
+      return 0
+    fi
+  fi
 
   jq -n \
     --arg session_id "$session_id" \
