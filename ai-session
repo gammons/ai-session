@@ -9,6 +9,8 @@ AI_DIR=".ai"
 SESSIONS_DIR="$AI_DIR/sessions"
 BREADCRUMB="$AI_DIR/.active-session"
 STALE_HOURS=2
+CONFIG_FILE="$AI_DIR/config.json"
+DEFAULT_CACHE_BASE="$HOME/.ai-sessions"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -224,9 +226,136 @@ get_trailer() {
   git log -1 --format='%(trailers:key='"$trailer"',valueonly)' "$commit" 2>/dev/null | head -1
 }
 
+# ─── External Session Repo Helpers ────────────────────────────────────────────
+
+# Read .ai/config.json — sets _SESSION_REPO_URL and _SESSION_CACHE_DIR globals.
+# Returns 1 if no external repo configured.
+_read_config() {
+  _SESSION_REPO_URL=""
+  _SESSION_CACHE_DIR=""
+
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local config="$toplevel/$CONFIG_FILE"
+
+  [[ -f "$config" ]] || return 1
+
+  _SESSION_REPO_URL=$(jq -r '.session_repo // empty' "$config" 2>/dev/null || true)
+  [[ -n "$_SESSION_REPO_URL" ]] || return 1
+
+  local custom_cache
+  custom_cache=$(jq -r '.local_cache // empty' "$config" 2>/dev/null || true)
+
+  local project
+  project=$(repo_name)
+
+  if [[ -n "$custom_cache" ]]; then
+    _SESSION_CACHE_DIR="$custom_cache/$project"
+  else
+    _SESSION_CACHE_DIR="$DEFAULT_CACHE_BASE/$project"
+  fi
+
+  return 0
+}
+
+# Clone session repo to local cache if not present, pull if present.
+_ensure_session_repo() {
+  _read_config || die "no external session repo configured"
+
+  if [[ -d "$_SESSION_CACHE_DIR/.git" ]]; then
+    git -C "$_SESSION_CACHE_DIR" pull --rebase --quiet 2>/dev/null || true
+  else
+    mkdir -p "$(dirname "$_SESSION_CACHE_DIR")"
+    git clone "$_SESSION_REPO_URL" "$_SESSION_CACHE_DIR" --quiet 2>/dev/null || {
+      # Repo may be empty — init and set remote
+      mkdir -p "$_SESSION_CACHE_DIR"
+      git -C "$_SESSION_CACHE_DIR" init --quiet
+      git -C "$_SESSION_CACHE_DIR" remote add origin "$_SESSION_REPO_URL" 2>/dev/null || true
+    }
+  fi
+}
+
+# git add -A && commit && push in the session repo. Non-fatal on push failure.
+_session_repo_commit_and_push() {
+  local msg="${1:-ai-session update}"
+
+  _read_config || return 0
+  [[ -d "$_SESSION_CACHE_DIR/.git" ]] || return 0
+
+  git -C "$_SESSION_CACHE_DIR" add -A 2>/dev/null || true
+  git -C "$_SESSION_CACHE_DIR" diff --cached --quiet 2>/dev/null && return 0
+
+  git -C "$_SESSION_CACHE_DIR" commit -m "$msg" --quiet 2>/dev/null || true
+  git -C "$_SESSION_CACHE_DIR" push --quiet 2>/dev/null || true
+}
+
+# Returns the sessions base directory — external cache or in-tree.
+_resolve_sessions_base() {
+  if _read_config; then
+    _ensure_session_repo
+    echo "$_SESSION_CACHE_DIR/sessions"
+  else
+    local toplevel
+    toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    echo "$toplevel/$SESSIONS_DIR"
+  fi
+}
+
+# Find a session dir by short_id glob, checking the right location.
+_resolve_session_dir() {
+  local target_id="$1"
+  local sessions_base
+  sessions_base=$(_resolve_sessions_base)
+
+  for d in "$sessions_base"/*"__${target_id}"/; do
+    if [[ -d "$d" ]]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve a trailer path to an absolute directory.
+# External paths look like <project>/sessions/<folder>, in-tree like .ai/sessions/<folder>.
+_resolve_trailer_path() {
+  local trailer_path="$1" toplevel="$2"
+
+  # If it starts with .ai/, it's in-tree
+  if [[ "$trailer_path" == .ai/* ]]; then
+    echo "$toplevel/$trailer_path"
+    return 0
+  fi
+
+  # Otherwise it's external — resolve via config
+  if _read_config 2>/dev/null; then
+    local cache_base
+    if [[ -n "$(jq -r '.local_cache // empty' "$toplevel/$CONFIG_FILE" 2>/dev/null)" ]]; then
+      cache_base=$(jq -r '.local_cache' "$toplevel/$CONFIG_FILE")
+    else
+      cache_base="$DEFAULT_CACHE_BASE"
+    fi
+    echo "$cache_base/$trailer_path"
+    return 0
+  fi
+
+  # Fallback: try in-tree
+  echo "$toplevel/$trailer_path"
+}
+
 # ─── Subcommands ──────────────────────────────────────────────────────────────
 
 cmd_init() {
+  local repo_url="" cache_path=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)  repo_url="$2"; shift 2 ;;
+      --cache) cache_path="$2"; shift 2 ;;
+      *)       die "unknown option: $1" ;;
+    esac
+  done
+
   local toplevel
   toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
   cd "$toplevel"
@@ -235,9 +364,43 @@ cmd_init() {
   mkdir -p "$SESSIONS_DIR"
 
   # Create .ai/.gitignore
-  cat > "$AI_DIR/.gitignore" << 'EOF'
+  if [[ -n "$repo_url" ]]; then
+    cat > "$AI_DIR/.gitignore" << 'EOF'
+.active-session
+sessions/
+EOF
+  else
+    cat > "$AI_DIR/.gitignore" << 'EOF'
 .active-session
 EOF
+  fi
+
+  # Write .ai/config.json if --repo specified
+  if [[ -n "$repo_url" ]]; then
+    local config_obj
+    config_obj=$(jq -n \
+      --arg repo "$repo_url" \
+      --arg cache "$cache_path" \
+      '{session_repo: $repo} + (if $cache != "" then {local_cache: $cache} else {} end)')
+    echo "$config_obj" > "$CONFIG_FILE"
+    info "ai-session: wrote $CONFIG_FILE"
+
+    # Check if remote repo exists; offer to create if not
+    if ! git ls-remote "$repo_url" &>/dev/null; then
+      info "warning: remote $repo_url does not appear to exist"
+      if command -v gh &>/dev/null; then
+        # Extract repo path from URL for gh repo create
+        local repo_path
+        repo_path=$(echo "$repo_url" | sed -E 's|.*[:/]([^/]+/[^/]+?)(\.git)?$|\1|')
+        info "hint: create it with: gh repo create $repo_path --private"
+      fi
+    fi
+
+    # Clone/init session repo to local cache
+    _read_config
+    _ensure_session_repo
+    info "ai-session: session repo cloned to $_SESSION_CACHE_DIR"
+  fi
 
   # Install git hooks
   local hooks_dir="$toplevel/.git/hooks"
@@ -384,13 +547,20 @@ cmd_new() {
   folder_name="${prefix}_${slug}__${sid}"
 
   # Determine target directory
-  local base_dir
+  local base_dir using_external=false
   if [[ -n "$repo_path" ]]; then
     base_dir="$repo_path"
+  elif _read_config 2>/dev/null; then
+    _ensure_session_repo
+    base_dir="$_SESSION_CACHE_DIR"
+    using_external=true
   else
     base_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   fi
-  session_dir="$base_dir/$SESSIONS_DIR/$folder_name"
+  session_dir="$base_dir/sessions/$folder_name"
+  if [[ "$using_external" == false && -z "$repo_path" ]]; then
+    session_dir="$base_dir/$SESSIONS_DIR/$folder_name"
+  fi
   mkdir -p "$session_dir"
 
   # Handle transcript
@@ -462,21 +632,33 @@ cmd_new() {
       transcript_hash: (if $transcript_hash == "" then null else $transcript_hash end)
     }' > "$session_dir/meta.json"
 
-  # Handle commit/amend mode
-  if [[ "$commit_mode" == "commit" ]]; then
-    git add "$session_dir"
-    git commit -m "ai-session: $goal" \
-      --trailer "Claude-Session: $sid" \
-      --trailer "Claude-Session-Path: $SESSIONS_DIR/$folder_name"
-  elif [[ "$commit_mode" == "amend" ]]; then
-    git add "$session_dir"
-    git commit --amend --no-edit \
-      --trailer "Claude-Session: $sid" \
-      --trailer "Claude-Session-Path: $SESSIONS_DIR/$folder_name"
+  # Determine output path for trailers
+  local output_path
+  if [[ "$using_external" == true ]]; then
+    local project
+    project=$(repo_name)
+    output_path="$project/sessions/$folder_name"
+  else
+    output_path="$SESSIONS_DIR/$folder_name"
   fi
 
-  # Output the folder name for callers
-  echo "$SESSIONS_DIR/$folder_name"
+  # Handle commit/amend mode (skip for external — hooks handle session repo commits)
+  if [[ "$using_external" == false ]]; then
+    if [[ "$commit_mode" == "commit" ]]; then
+      git add "$session_dir"
+      git commit -m "ai-session: $goal" \
+        --trailer "Claude-Session: $sid" \
+        --trailer "Claude-Session-Path: $output_path"
+    elif [[ "$commit_mode" == "amend" ]]; then
+      git add "$session_dir"
+      git commit --amend --no-edit \
+        --trailer "Claude-Session: $sid" \
+        --trailer "Claude-Session-Path: $output_path"
+    fi
+  fi
+
+  # Output the path for callers
+  echo "$output_path"
 }
 
 cmd_attach() {
@@ -485,18 +667,8 @@ cmd_attach() {
   local target_id="$1"; shift
   local -a shas=("$@")
 
-  local toplevel
-  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
-
-  # Find session directory by short-id
-  local session_dir=""
-  for d in "$toplevel/$SESSIONS_DIR"/*"__${target_id}"/; do
-    if [[ -d "$d" ]]; then
-      session_dir="$d"
-      break
-    fi
-  done
-  [[ -n "$session_dir" ]] || die "session not found: $target_id"
+  local session_dir
+  session_dir=$(_resolve_session_dir "$target_id") || die "session not found: $target_id"
 
   local meta="$session_dir/meta.json"
   [[ -f "$meta" ]] || die "meta.json not found in $session_dir"
@@ -508,6 +680,11 @@ cmd_attach() {
     '.commits = (.commits + $new_commits | unique)' "$meta" > "$tmp" && mv "$tmp" "$meta"
 
   info "attached ${#shas[@]} commit(s) to session $target_id"
+
+  # Push to session repo if external
+  if _read_config 2>/dev/null; then
+    _session_repo_commit_and_push "attach commits to session $target_id"
+  fi
 }
 
 cmd_pr() {
@@ -544,9 +721,12 @@ cmd_pr() {
 
   [[ ${#session_ids[@]} -gt 0 ]] || { info "no sessions found to link"; return 0; }
 
+  local sessions_base
+  sessions_base=$(_resolve_sessions_base)
+
   # Update each session's meta.json with PR link
   for sid in "${session_ids[@]}"; do
-    for d in "$toplevel/$SESSIONS_DIR"/*"__${sid}"/; do
+    for d in "$sessions_base"/*"__${sid}"/; do
       if [[ -d "$d" && -f "$d/meta.json" ]]; then
         local tmp
         tmp=$(mktemp)
@@ -555,9 +735,14 @@ cmd_pr() {
     done
   done
 
+  # Push updates if external
+  if _read_config 2>/dev/null; then
+    _session_repo_commit_and_push "link sessions to PR #$pr_number"
+  fi
+
   # Build AI Sessions table for PR body
   local table
-  table=$(_build_pr_table "$toplevel" "${session_ids[@]}")
+  table=$(_build_pr_table "$sessions_base" "${session_ids[@]}")
 
   # Update PR body
   local current_body
@@ -583,7 +768,7 @@ $new_section")
 }
 
 _build_pr_table() {
-  local toplevel="$1"; shift
+  local sessions_base="$1"; shift
   local -a sids=("$@")
 
   echo "### AI Sessions"
@@ -592,25 +777,24 @@ _build_pr_table() {
   echo "|---------|------|-------|---------|"
 
   for sid in "${sids[@]}"; do
-    for d in "$toplevel/$SESSIONS_DIR"/*"__${sid}"/; do
+    for d in "$sessions_base"/*"__${sid}"/; do
       if [[ -d "$d" && -f "$d/meta.json" ]]; then
         local goal model commits_str
         goal=$(jq -r '.goal' "$d/meta.json")
         model=$(jq -r '.model' "$d/meta.json")
         commits_str=$(jq -r '.commits | map(.[0:7]) | join(", ")' "$d/meta.json")
-        local rel_path="${d#$toplevel/}"
-        echo "| [\`$sid\`]($rel_path) | $goal | $model | $commits_str |"
+        echo "| \`$sid\` | $goal | $model | $commits_str |"
       fi
     done
   done
 }
 
 cmd_list() {
-  local toplevel
-  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+  local sessions_base
+  sessions_base=$(_resolve_sessions_base)
 
   local found=false
-  for meta in "$toplevel/$SESSIONS_DIR"/*/meta.json; do
+  for meta in "$sessions_base"/*/meta.json; do
     [[ -f "$meta" ]] || continue
     found=true
     local sid goal created model
@@ -630,24 +814,18 @@ cmd_show() {
   [[ $# -ge 1 ]] || die "usage: ai-session show <short-id>"
   local target_id="$1"
 
-  local toplevel
-  toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
+  local session_dir
+  session_dir=$(_resolve_session_dir "$target_id") || die "session not found: $target_id"
 
-  for d in "$toplevel/$SESSIONS_DIR"/*"__${target_id}"/; do
-    if [[ -d "$d" && -f "$d/meta.json" ]]; then
-      jq . "$d/meta.json"
-      return 0
-    fi
-  done
-
-  die "session not found: $target_id"
+  [[ -f "$session_dir/meta.json" ]] || die "meta.json not found"
+  jq . "$session_dir/meta.json"
 }
 
 cmd_resume() {
   [[ $# -ge 1 ]] || die "usage: ai-session resume <id|sha|--pr N>"
 
   local target="$1"
-  local session_path=""
+  local full_path=""
 
   local toplevel
   toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not a git repository"
@@ -655,31 +833,31 @@ cmd_resume() {
   if [[ "$target" == "--pr" ]]; then
     [[ $# -ge 2 ]] || die "usage: ai-session resume --pr <number>"
     local pr_num="$2"
-    # Find commits from PR, look for session trailers
     local sha
     sha=$(gh pr view "$pr_num" --json commits -q '.commits[-1].oid' 2>/dev/null) || die "cannot read PR #$pr_num"
+    local session_path
     session_path=$(get_trailer "$sha" "Claude-Session-Path")
+    [[ -n "$session_path" ]] || die "no session trailer found in PR #$pr_num"
+    # Resolve path — could be external (<project>/sessions/...) or in-tree (.ai/sessions/...)
+    full_path=$(_resolve_trailer_path "$session_path" "$toplevel")
   else
-    # First, try as a session short ID (look for matching folder)
-    for d in "$toplevel/$SESSIONS_DIR"/*"__${target}"/; do
-      if [[ -d "$d" ]]; then
-        session_path="${d#$toplevel/}"
-        # Remove trailing slash
-        session_path="${session_path%/}"
-        break
-      fi
-    done
+    # First, try as a session short ID via resolver
+    full_path=$(_resolve_session_dir "$target" 2>/dev/null || true)
 
-    # If not found as session ID, try as a commit SHA/ref
-    if [[ -z "$session_path" ]]; then
+    # If not found, try as a commit SHA/ref
+    if [[ -z "$full_path" ]]; then
+      local session_path
       session_path=$(get_trailer "$target" "Claude-Session-Path")
+      if [[ -n "$session_path" ]]; then
+        full_path=$(_resolve_trailer_path "$session_path" "$toplevel")
+      fi
     fi
   fi
 
-  [[ -n "$session_path" ]] || die "no session found for: $target"
+  # Remove trailing slash
+  full_path="${full_path%/}"
 
-  local full_path="$toplevel/$session_path"
-  [[ -d "$full_path" ]] || die "session directory not found: $full_path"
+  [[ -n "$full_path" && -d "$full_path" ]] || die "no session found for: $target"
 
   local meta="$full_path/meta.json"
   [[ -f "$meta" ]] || die "meta.json not found"
@@ -772,22 +950,36 @@ cmd_hook_prepare_commit_msg() {
   first_line=$(head -1 "$msg_file" | sed 's/^#.*//; s/^[[:space:]]*//' || true)
   [[ -n "$first_line" ]] || return 0
 
-  # Create session
+  # Create session (cmd_new now writes to the right place based on config)
   local session_path
   session_path=$(cmd_new --goal "$first_line" --auto 2>/dev/null) || return 0
 
-  # Read short_id from the created meta.json
-  local sid
-  sid=$(jq -r '.short_id' "$toplevel/$session_path/meta.json" 2>/dev/null || true)
+  local using_external=false
+  _read_config 2>/dev/null && using_external=true
+
+  # Read short_id from the created session
+  local sid session_abs_dir
+  if [[ "$using_external" == true ]]; then
+    local cache_base
+    cache_base=$(jq -r '.local_cache // empty' "$toplevel/$CONFIG_FILE" 2>/dev/null || true)
+    [[ -z "$cache_base" ]] && cache_base="$DEFAULT_CACHE_BASE"
+    session_abs_dir="$cache_base/$session_path"
+  else
+    session_abs_dir="$toplevel/$session_path"
+  fi
+
+  sid=$(jq -r '.short_id' "$session_abs_dir/meta.json" 2>/dev/null || true)
   [[ -n "$sid" ]] || return 0
 
-  # Stage session files
-  git add "$session_path" 2>/dev/null || true
+  if [[ "$using_external" == true ]]; then
+    # Commit and push to session repo
+    _session_repo_commit_and_push "session: $first_line"
+  else
+    # Stage session files in code repo
+    git add "$session_path" 2>/dev/null || true
+  fi
 
   # Append trailers to commit message
-  # Use git interpret-trailers for proper formatting
-  local tmp
-  tmp=$(mktemp)
   git interpret-trailers \
     --trailer "Claude-Session: $sid" \
     --trailer "Claude-Session-Path: $session_path" \
@@ -809,7 +1001,11 @@ cmd_hook_post_commit() {
   session_path=$(get_trailer HEAD "Claude-Session-Path")
   [[ -n "$session_path" ]] || return 0
 
-  local meta="$toplevel/$session_path/meta.json"
+  # Resolve meta.json path (external or in-tree)
+  local meta
+  local full_path
+  full_path=$(_resolve_trailer_path "$session_path" "$toplevel")
+  meta="$full_path/meta.json"
   [[ -f "$meta" ]] || return 0
 
   local commit_sha
@@ -819,6 +1015,11 @@ cmd_hook_post_commit() {
   local tmp
   tmp=$(mktemp)
   jq --arg sha "$commit_sha" '.commits = (.commits + [$sha] | unique)' "$meta" > "$tmp" && mv "$tmp" "$meta"
+
+  # Push to session repo if external
+  if _read_config 2>/dev/null; then
+    _session_repo_commit_and_push "backfill commit $commit_sha"
+  fi
 }
 
 cmd_hook_pre_push() {
@@ -848,7 +1049,13 @@ cmd_hook_pre_push() {
     done < <(git log "$range" --format='%(trailers:key=Claude-Session,valueonly)' 2>/dev/null | grep -v '^$' | sort -u)
   done
 
-  [[ ${#session_ids[@]} -gt 0 ]] || return 0
+  if [[ ${#session_ids[@]} -eq 0 ]]; then
+    # Even without sessions, do a catch-up push if external
+    if _read_config 2>/dev/null; then
+      _session_repo_commit_and_push "catch-up push on pre-push" || true
+    fi
+    return 0
+  fi
 
   # Check if current branch has an open PR
   local pr_number
@@ -857,6 +1064,11 @@ cmd_hook_pre_push() {
 
   # Auto-update PR body
   cmd_pr "${session_ids[@]}" --pr "$pr_number" 2>/dev/null || true
+
+  # Catch-up push of session repo (in case earlier pushes failed)
+  if _read_config 2>/dev/null; then
+    _session_repo_commit_and_push "catch-up push on pre-push" || true
+  fi
 }
 
 # ─── Main Dispatch ────────────────────────────────────────────────────────────
@@ -868,7 +1080,8 @@ ai-session — Persist Claude Code conversation transcripts as git artifacts
 Usage: ai-session <command> [options]
 
 Commands:
-  init                Set up hooks + .ai/ directory in current repo
+  init [--repo <url>] [--cache <path>]
+                      Set up hooks + .ai/ directory in current repo
   new                 Create a new session
   attach <id> <sha>   Link session to commit(s)
   pr [<id>...] --pr N Link sessions to PR + update PR body
@@ -876,6 +1089,10 @@ Commands:
   show <id>           Print session metadata
   resume <id|sha|--pr N> Launch Claude Code with linked session
   _mark-active        Internal: write breadcrumb (Claude Code hook)
+
+init flags:
+  --repo <url>        Store sessions in an external git repo
+  --cache <path>      Local cache base dir (default: ~/.ai-sessions)
 
 new flags:
   --goal "..."        Summary (required)

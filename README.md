@@ -37,7 +37,8 @@ When you work with Claude Code, that reasoning exists in the conversation transc
 │ git commit   │ ◀────────────────────── │ ai-session hook   │
 │              │   creates session,       │  • creates folder │
 │              │   adds trailers,         │  • copies transcript│
-│              │   stages .ai/sessions/   │  • injects trailers│
+│              │   stages .ai/sessions/   │  • scrubs secrets  │
+│              │                          │  • injects trailers│
 └──────┬──────┘                           └──────────────────┘
        │
        │            post-commit
@@ -78,6 +79,26 @@ git commit -m "Set up ai-session"
 
 This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`. Committing `.ai/` and `.claude/settings.json` means teammates get the session history and the Claude Code hook config automatically.
 
+#### External session repository (optional)
+
+To keep transcripts out of your code repo, store them in a separate git repository:
+
+```bash
+ai-session init --repo git@github.com:your-org/ai-sessions.git
+git add .ai .claude/settings.json
+git commit -m "Set up ai-session with external repo"
+```
+
+This writes `.ai/config.json` (committed, so teammates auto-inherit the config), clones the session repo to `~/.ai-sessions/<project>`, and adds `sessions/` to `.ai/.gitignore` so transcripts never enter the code repo.
+
+You can override the local cache location:
+
+```bash
+ai-session init --repo git@github.com:your-org/ai-sessions.git --cache /tmp/sessions
+```
+
+One session repo can serve multiple code repos — sessions are namespaced by project name (the basename of your git working tree). The session repo is pushed on every commit and as a catch-up during `git push`.
+
 ### Use it
 
 There's nothing else to do. Work normally:
@@ -103,6 +124,7 @@ And your PR gets an AI Sessions table:
 
 ## What gets stored
 
+**In-tree** (default):
 ```
 .ai/
   sessions/
@@ -111,6 +133,19 @@ And your PR gets an AI Sessions table:
       transcript.jsonl     # raw Claude Code transcript
       transcript.md        # human-readable markdown conversion
 ```
+
+**External repo** (with `--repo`):
+```
+# In the session repo (e.g. ~/.ai-sessions/my-project/)
+my-project/
+  sessions/
+    2026-02-22_0715Z_fix-race-condition-in-websocket-reconnec__2d8dfda4/
+      meta.json
+      transcript.jsonl
+      transcript.md
+```
+
+The `Claude-Session-Path` trailer changes accordingly — `<project>/sessions/<folder>` when external, `.ai/sessions/<folder>` when in-tree. All commands (`list`, `show`, `resume`, etc.) resolve the right location automatically via `.ai/config.json`.
 
 **`meta.json`** ties everything together:
 
@@ -133,9 +168,16 @@ And your PR gets an AI Sessions table:
 
 ## Commands
 
-### `ai-session init`
+### `ai-session init [--repo <url>] [--cache <path>]`
 
 One-time setup per repo. Creates `.ai/`, installs git hooks, configures Claude Code hook. Safe to run again — idempotent.
+
+| Flag | Description |
+|------|-------------|
+| `--repo <url>` | Store sessions in an external git repository instead of in-tree |
+| `--cache <path>` | Local cache base directory (default: `~/.ai-sessions`) |
+
+When `--repo` is used, `.ai/config.json` is written and committed so teammates auto-inherit the external repo config.
 
 ### `ai-session list`
 
@@ -226,15 +268,51 @@ When Claude Code edits a file (via `Edit` or `Write` tools), a `PostToolUse` hoo
 **`prepare-commit-msg`** checks for the breadcrumb. If it exists and is fresh (< 2 hours), the hook:
 1. Uses the commit message's first line as the session goal
 2. Creates the session folder with `meta.json` and transcript files
-3. Stages everything under `.ai/sessions/`
-4. Appends `Claude-Session` and `Claude-Session-Path` trailers to the commit message
-5. Removes the breadcrumb
+3. Scrubs secrets from transcripts (see [Secret scrubbing](#secret-scrubbing))
+4. **In-tree:** stages everything under `.ai/sessions/`. **External:** commits and pushes to the session repo.
+5. Appends `Claude-Session` and `Claude-Session-Path` trailers to the commit message
+6. Removes the breadcrumb
 
-**`post-commit`** reads the trailers from the new commit and backfills the commit SHA into `meta.json`.
+**`post-commit`** reads the trailers from the new commit and backfills the commit SHA into `meta.json`. When using an external repo, pushes the update.
 
-**`pre-push`** scans outgoing commits for session trailers. If the current branch has an open PR, it auto-updates the PR body with an AI Sessions table.
+**`pre-push`** scans outgoing commits for session trailers. If the current branch has an open PR, it auto-updates the PR body with an AI Sessions table. Also does a catch-up push to the session repo if earlier pushes failed.
 
 If no breadcrumb exists (you're making a normal commit without Claude), all hooks silently no-op.
+
+## Secret scrubbing
+
+Transcripts can contain secrets — API keys, tokens, or passwords that appeared in file contents, command output, or user messages. `ai-session` automatically scrubs these before they reach git.
+
+### Built-in patterns
+
+The following are redacted automatically from every transcript:
+
+- **AWS keys** — `AKIA...` access key IDs
+- **GitHub tokens** — `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` prefixed tokens
+- **Slack tokens** — `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-`, `xoxs-` prefixed tokens
+- **JWTs** — `eyJ...` three-segment tokens
+- **Bearer tokens** — `Bearer <token>` in auth headers
+- **Private keys** — PEM-encoded `-----BEGIN ... PRIVATE KEY-----` blocks (including the key body)
+- **Generic key/value secrets** — assignments like `api_key=`, `password:`, `token :=`, `client_secret=`, etc. where the value is 8+ characters (case-insensitive, supports quoted and unquoted values)
+
+Each match is replaced with `[REDACTED]`.
+
+### Two-layer defense
+
+1. **`_scrub_secrets`** — runs `sed` patterns over transcript files immediately after copying them, redacting all matches in-place.
+2. **`_check_secrets`** — scans the scrubbed files for any remaining high-confidence patterns (AWS keys, GitHub tokens, JWTs, private key headers). If anything slips through, session creation is **aborted** and the session directory is deleted — nothing gets staged.
+
+### Custom patterns
+
+`ai-session init` creates `.ai/scrub-patterns`, a file where you can add project-specific patterns (one per line, sed ERE syntax). These are applied in addition to the built-in patterns. Lines starting with `#` are comments.
+
+```
+# .ai/scrub-patterns
+INTERNAL_SERVICE_KEY_[A-Za-z0-9]{32}
+my-company-token-[0-9a-f]{40}
+```
+
+This file is committed to git so your whole team shares the same scrubbing rules.
 
 ## FAQ
 
@@ -251,7 +329,10 @@ Yes. Use `ai-session new --goal "..." --transcript my-notes.md --commit` to manu
 The hooks are thin shell wrappers. You can copy the one-liner from each hook into your existing hook manager config.
 
 **How big are the transcripts?**
-Varies. A typical Claude Code session produces 10-100KB of JSONL. For large repos, consider using `--repo` to store sessions in a separate repository.
+Varies. A typical Claude Code session produces 10-100KB of JSONL. To keep transcripts out of your code repo entirely, use `ai-session init --repo <url>` to store them in a separate repository.
+
+**What if a secret gets through the scrubber?**
+The `_check_secrets` safety net will catch high-confidence patterns (AWS keys, GitHub tokens, JWTs, private key headers) and abort the session — nothing gets committed. For other patterns, add them to `.ai/scrub-patterns`. If a secret has already been committed, rotate it immediately and use `git filter-repo` to remove it from history.
 
 **Can I strip sessions from history later?**
 Yes — they're regular files. Use `git filter-repo` or similar tools to remove `.ai/sessions/` from history if needed.
