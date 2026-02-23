@@ -229,7 +229,8 @@ get_trailer() {
 # ─── External Session Repo Helpers ────────────────────────────────────────────
 
 # Read .ai/config.json — sets _SESSION_REPO_URL and _SESSION_CACHE_DIR globals.
-# Returns 1 if no external repo configured.
+# Returns 1 only if config file is missing (pre-init state).
+# _SESSION_REPO_URL may be empty (no remote configured).
 _read_config() {
   _SESSION_REPO_URL=""
   _SESSION_CACHE_DIR=""
@@ -241,7 +242,6 @@ _read_config() {
   [[ -f "$config" ]] || return 1
 
   _SESSION_REPO_URL=$(jq -r '.session_repo // empty' "$config" 2>/dev/null || true)
-  [[ -n "$_SESSION_REPO_URL" ]] || return 1
 
   local custom_cache
   custom_cache=$(jq -r '.local_cache // empty' "$config" 2>/dev/null || true)
@@ -258,24 +258,33 @@ _read_config() {
   return 0
 }
 
-# Clone session repo to local cache if not present, pull if present.
+# Ensure local session repo exists. Clone from remote if configured, otherwise git init.
 _ensure_session_repo() {
-  _read_config || die "no external session repo configured"
+  _read_config || die "no session config found — run 'ai-session init' first"
 
   if [[ -d "$_SESSION_CACHE_DIR/.git" ]]; then
-    git -C "$_SESSION_CACHE_DIR" pull --rebase --quiet 2>/dev/null || true
+    # Already exists — pull if remote configured
+    if [[ -n "$_SESSION_REPO_URL" ]]; then
+      git -C "$_SESSION_CACHE_DIR" pull --rebase --quiet 2>/dev/null || true
+    fi
   else
     mkdir -p "$(dirname "$_SESSION_CACHE_DIR")"
-    git clone "$_SESSION_REPO_URL" "$_SESSION_CACHE_DIR" --quiet 2>/dev/null || {
-      # Repo may be empty — init and set remote
+    if [[ -n "$_SESSION_REPO_URL" ]]; then
+      git clone "$_SESSION_REPO_URL" "$_SESSION_CACHE_DIR" --quiet 2>/dev/null || {
+        # Repo may be empty — init and set remote
+        mkdir -p "$_SESSION_CACHE_DIR"
+        git -C "$_SESSION_CACHE_DIR" init --quiet
+        git -C "$_SESSION_CACHE_DIR" remote add origin "$_SESSION_REPO_URL" 2>/dev/null || true
+      }
+    else
+      # No remote — just init a local repo
       mkdir -p "$_SESSION_CACHE_DIR"
       git -C "$_SESSION_CACHE_DIR" init --quiet
-      git -C "$_SESSION_CACHE_DIR" remote add origin "$_SESSION_REPO_URL" 2>/dev/null || true
-    }
+    fi
   fi
 }
 
-# git add -A && commit && push in the session repo. Non-fatal on push failure.
+# git add -A && commit in the session repo. Push only if remote configured.
 _session_repo_commit_and_push() {
   local msg="${1:-ai-session update}"
 
@@ -286,15 +295,20 @@ _session_repo_commit_and_push() {
   git -C "$_SESSION_CACHE_DIR" diff --cached --quiet 2>/dev/null && return 0
 
   git -C "$_SESSION_CACHE_DIR" commit -m "$msg" --quiet 2>/dev/null || true
-  git -C "$_SESSION_CACHE_DIR" push --quiet 2>/dev/null || true
+
+  # Only push if a remote is configured
+  if [[ -n "$_SESSION_REPO_URL" ]]; then
+    git -C "$_SESSION_CACHE_DIR" push --quiet 2>/dev/null || true
+  fi
 }
 
-# Returns the sessions base directory — external cache or in-tree.
+# Returns the sessions base directory — external cache, or in-tree for pre-init repos.
 _resolve_sessions_base() {
   if _read_config; then
     _ensure_session_repo
     echo "$_SESSION_CACHE_DIR/sessions"
   else
+    # Pre-init fallback: in-tree for backward compat
     local toplevel
     toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     echo "$toplevel/$SESSIONS_DIR"
@@ -361,46 +375,51 @@ cmd_init() {
   cd "$toplevel"
 
   # Create .ai directory structure
-  mkdir -p "$SESSIONS_DIR"
+  mkdir -p "$AI_DIR"
 
-  # Create .ai/.gitignore
-  if [[ -n "$repo_url" ]]; then
-    cat > "$AI_DIR/.gitignore" << 'EOF'
+  # Always gitignore sessions/ — they live in the external cache
+  cat > "$AI_DIR/.gitignore" << 'EOF'
 .active-session
 sessions/
 EOF
-  else
-    cat > "$AI_DIR/.gitignore" << 'EOF'
-.active-session
-EOF
-  fi
 
-  # Write .ai/config.json if --repo specified
+  # Write .ai/config.json — always, with session_repo only if --repo provided
+  local config_obj
+  config_obj=$(jq -n \
+    --arg repo "$repo_url" \
+    --arg cache "$cache_path" \
+    '(if $repo != "" then {session_repo: $repo} else {} end) + (if $cache != "" then {local_cache: $cache} else {} end)')
+  echo "$config_obj" > "$CONFIG_FILE"
+  info "ai-session: wrote $CONFIG_FILE"
+
+  # If --repo provided, validate the remote
   if [[ -n "$repo_url" ]]; then
-    local config_obj
-    config_obj=$(jq -n \
-      --arg repo "$repo_url" \
-      --arg cache "$cache_path" \
-      '{session_repo: $repo} + (if $cache != "" then {local_cache: $cache} else {} end)')
-    echo "$config_obj" > "$CONFIG_FILE"
-    info "ai-session: wrote $CONFIG_FILE"
-
-    # Check if remote repo exists; offer to create if not
     if ! git ls-remote "$repo_url" &>/dev/null; then
       info "warning: remote $repo_url does not appear to exist"
       if command -v gh &>/dev/null; then
-        # Extract repo path from URL for gh repo create
         local repo_path
         repo_path=$(echo "$repo_url" | sed -E 's|.*[:/]([^/]+/[^/]+?)(\.git)?$|\1|')
         info "hint: create it with: gh repo create $repo_path --private"
       fi
     fi
-
-    # Clone/init session repo to local cache
-    _read_config
-    _ensure_session_repo
-    info "ai-session: session repo cloned to $_SESSION_CACHE_DIR"
   fi
+
+  # Always init local session repo
+  _read_config
+  _ensure_session_repo
+
+  # If --repo provided, ensure remote is set on the local cache
+  if [[ -n "$repo_url" ]]; then
+    local existing_remote
+    existing_remote=$(git -C "$_SESSION_CACHE_DIR" remote get-url origin 2>/dev/null || true)
+    if [[ -z "$existing_remote" ]]; then
+      git -C "$_SESSION_CACHE_DIR" remote add origin "$repo_url" 2>/dev/null || true
+    elif [[ "$existing_remote" != "$repo_url" ]]; then
+      git -C "$_SESSION_CACHE_DIR" remote set-url origin "$repo_url" 2>/dev/null || true
+    fi
+  fi
+
+  info "ai-session: session cache at $_SESSION_CACHE_DIR"
 
   # Install git hooks
   local hooks_dir="$toplevel/.git/hooks"
@@ -503,7 +522,7 @@ EOF
 
 cmd_new() {
   local goal="" transcript_path="" from_stdin=false auto_detect=false
-  local model="" author="" commit_mode="" repo_path=""
+  local model="" author="" repo_path=""
   local -a links=()
 
   while [[ $# -gt 0 ]]; do
@@ -515,8 +534,6 @@ cmd_new() {
       --model)      model="$2"; shift 2 ;;
       --author)     author="$2"; shift 2 ;;
       --link)       links+=("$2"); shift 2 ;;
-      --commit)     commit_mode="commit"; shift ;;
-      --amend)      commit_mode="amend"; shift ;;
       --repo)       repo_path="$2"; shift 2 ;;
       *)            die "unknown option: $1" ;;
     esac
@@ -546,22 +563,36 @@ cmd_new() {
   prefix=$(now_folder_prefix)
   folder_name="${prefix}_${slug}__${sid}"
 
-  # Determine target directory
-  local base_dir using_external=false
+  # Determine target directory — always external
+  local base_dir
   if [[ -n "$repo_path" ]]; then
     base_dir="$repo_path"
   elif _read_config 2>/dev/null; then
     _ensure_session_repo
     base_dir="$_SESSION_CACHE_DIR"
-    using_external=true
   else
+    # Pre-init fallback: in-tree for backward compat
     base_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+    local existing_dir_intree
+    existing_dir_intree=$(find "$base_dir/$SESSIONS_DIR" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1)
+    if [[ -n "$existing_dir_intree" ]]; then
+      session_dir="$existing_dir_intree"
+    else
+      session_dir="$base_dir/$SESSIONS_DIR/$folder_name"
+    fi
+    mkdir -p "$session_dir"
   fi
-  session_dir="$base_dir/sessions/$folder_name"
-  if [[ "$using_external" == false && -z "$repo_path" ]]; then
-    session_dir="$base_dir/$SESSIONS_DIR/$folder_name"
+  if [[ -z "${session_dir:-}" ]]; then
+    # Reuse existing session folder if one with this short_id already exists
+    local existing_dir
+    existing_dir=$(find "$base_dir/sessions" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1)
+    if [[ -n "$existing_dir" ]]; then
+      session_dir="$existing_dir"
+    else
+      session_dir="$base_dir/sessions/$folder_name"
+    fi
+    mkdir -p "$session_dir"
   fi
-  mkdir -p "$session_dir"
 
   # Handle transcript
   local transcript_hash=""
@@ -634,27 +665,15 @@ cmd_new() {
 
   # Determine output path for trailers
   local output_path
-  if [[ "$using_external" == true ]]; then
+  if [[ -n "$repo_path" ]]; then
+    output_path="sessions/$folder_name"
+  elif _read_config 2>/dev/null; then
     local project
     project=$(repo_name)
     output_path="$project/sessions/$folder_name"
   else
+    # Pre-init fallback: in-tree path
     output_path="$SESSIONS_DIR/$folder_name"
-  fi
-
-  # Handle commit/amend mode (skip for external — hooks handle session repo commits)
-  if [[ "$using_external" == false ]]; then
-    if [[ "$commit_mode" == "commit" ]]; then
-      git add "$session_dir"
-      git commit -m "ai-session: $goal" \
-        --trailer "Claude-Session: $sid" \
-        --trailer "Claude-Session-Path: $output_path"
-    elif [[ "$commit_mode" == "amend" ]]; then
-      git add "$session_dir"
-      git commit --amend --no-edit \
-        --trailer "Claude-Session: $sid" \
-        --trailer "Claude-Session-Path: $output_path"
-    fi
   fi
 
   # Output the path for callers
@@ -681,10 +700,8 @@ cmd_attach() {
 
   info "attached ${#shas[@]} commit(s) to session $target_id"
 
-  # Push to session repo if external
-  if _read_config 2>/dev/null; then
-    _session_repo_commit_and_push "attach commits to session $target_id"
-  fi
+  # Commit (and push if remote configured) to session repo
+  _session_repo_commit_and_push "attach commits to session $target_id"
 }
 
 cmd_pr() {
@@ -735,10 +752,8 @@ cmd_pr() {
     done
   done
 
-  # Push updates if external
-  if _read_config 2>/dev/null; then
-    _session_repo_commit_and_push "link sessions to PR #$pr_number"
-  fi
+  # Commit (and push if remote configured) to session repo
+  _session_repo_commit_and_push "link sessions to PR #$pr_number"
 
   # Build AI Sessions table for PR body
   local table
@@ -950,34 +965,19 @@ cmd_hook_prepare_commit_msg() {
   first_line=$(head -1 "$msg_file" | sed 's/^#.*//; s/^[[:space:]]*//' || true)
   [[ -n "$first_line" ]] || return 0
 
-  # Create session (cmd_new now writes to the right place based on config)
+  # Create session (always writes to external cache)
   local session_path
   session_path=$(cmd_new --goal "$first_line" --auto 2>/dev/null) || return 0
 
-  local using_external=false
-  _read_config 2>/dev/null && using_external=true
-
   # Read short_id from the created session
   local sid session_abs_dir
-  if [[ "$using_external" == true ]]; then
-    local cache_base
-    cache_base=$(jq -r '.local_cache // empty' "$toplevel/$CONFIG_FILE" 2>/dev/null || true)
-    [[ -z "$cache_base" ]] && cache_base="$DEFAULT_CACHE_BASE"
-    session_abs_dir="$cache_base/$session_path"
-  else
-    session_abs_dir="$toplevel/$session_path"
-  fi
+  session_abs_dir=$(_resolve_trailer_path "$session_path" "$toplevel")
 
   sid=$(jq -r '.short_id' "$session_abs_dir/meta.json" 2>/dev/null || true)
   [[ -n "$sid" ]] || return 0
 
-  if [[ "$using_external" == true ]]; then
-    # Commit and push to session repo
-    _session_repo_commit_and_push "session: $first_line"
-  else
-    # Stage session files in code repo
-    git add "$session_path" 2>/dev/null || true
-  fi
+  # Commit (and push if remote configured) to session repo
+  _session_repo_commit_and_push "session: $first_line"
 
   # Append trailers to commit message
   git interpret-trailers \
@@ -1016,10 +1016,8 @@ cmd_hook_post_commit() {
   tmp=$(mktemp)
   jq --arg sha "$commit_sha" '.commits = (.commits + [$sha] | unique)' "$meta" > "$tmp" && mv "$tmp" "$meta"
 
-  # Push to session repo if external
-  if _read_config 2>/dev/null; then
-    _session_repo_commit_and_push "backfill commit $commit_sha"
-  fi
+  # Commit (and push if remote configured) to session repo
+  _session_repo_commit_and_push "backfill commit $commit_sha"
 }
 
 cmd_hook_pre_push() {
@@ -1050,10 +1048,8 @@ cmd_hook_pre_push() {
   done
 
   if [[ ${#session_ids[@]} -eq 0 ]]; then
-    # Even without sessions, do a catch-up push if external
-    if _read_config 2>/dev/null; then
-      _session_repo_commit_and_push "catch-up push on pre-push" || true
-    fi
+    # Catch-up push if remote configured
+    _session_repo_commit_and_push "catch-up push on pre-push" || true
     return 0
   fi
 
@@ -1066,9 +1062,7 @@ cmd_hook_pre_push() {
   cmd_pr "${session_ids[@]}" --pr "$pr_number" 2>/dev/null || true
 
   # Catch-up push of session repo (in case earlier pushes failed)
-  if _read_config 2>/dev/null; then
-    _session_repo_commit_and_push "catch-up push on pre-push" || true
-  fi
+  _session_repo_commit_and_push "catch-up push on pre-push" || true
 }
 
 # ─── Main Dispatch ────────────────────────────────────────────────────────────
@@ -1081,7 +1075,9 @@ Usage: ai-session <command> [options]
 
 Commands:
   init [--repo <url>] [--cache <path>]
-                      Set up hooks + .ai/ directory in current repo
+                      Set up hooks + .ai/ directory in current repo.
+                      Sessions are stored locally at ~/.ai-sessions/<project>.
+                      Use --repo to also push sessions to a remote git repo.
   new                 Create a new session
   attach <id> <sha>   Link session to commit(s)
   pr [<id>...] --pr N Link sessions to PR + update PR body
@@ -1091,7 +1087,7 @@ Commands:
   _mark-active        Internal: write breadcrumb (Claude Code hook)
 
 init flags:
-  --repo <url>        Store sessions in an external git repo
+  --repo <url>        Also push sessions to a remote git repo
   --cache <path>      Local cache base dir (default: ~/.ai-sessions)
 
 new flags:
@@ -1102,9 +1098,7 @@ new flags:
   --model <name>      Model name
   --author <name>     Author (default: git user.name)
   --link <url>        Arbitrary URL (repeatable)
-  --commit            Stage + commit with trailers
-  --amend             Amend last commit with trailers
-  --repo <path>       External ai-log repo
+  --repo <path>       Override session repo path
 EOF
 }
 
