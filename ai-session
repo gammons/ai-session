@@ -4,7 +4,7 @@ set -euo pipefail
 # ai-session — Persist Claude Code conversation transcripts as git artifacts
 # Usage: ai-session <command> [options]
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 AI_DIR=".ai"
 SESSIONS_DIR="$AI_DIR/sessions"
 BREADCRUMB="$AI_DIR/.active-session"
@@ -139,6 +139,85 @@ file_sha256() {
   fi
 }
 
+# Scrub secrets from a file in-place
+_scrub_secrets() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+
+  # Load user-defined patterns from .ai/scrub-patterns if present
+  local toplevel
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  local custom_patterns_file="$toplevel/$AI_DIR/scrub-patterns"
+
+  # Built-in patterns (sed ERE)
+  # Note: GNU sed supports the I flag for case-insensitive matching
+  sed -E -i \
+    -e 's/AKIA[0-9A-Z]{16}/[REDACTED]/g' \
+    -e 's/gh[pousr]_[A-Za-z0-9_]{36,}/[REDACTED]/g' \
+    -e 's/xox[baprs]-[A-Za-z0-9-]+/[REDACTED]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+/[REDACTED]/g' \
+    -e 's/Bearer [A-Za-z0-9\._~+/=-]+/Bearer [REDACTED]/g' \
+    -e 's/-----BEGIN[A-Z ]*PRIVATE KEY-----/[REDACTED PRIVATE KEY]/g' \
+    -e 's/-----END[A-Z ]*PRIVATE KEY-----/[REDACTED END KEY]/g' \
+    "$file"
+
+  # Scrub private key bodies (base64 lines between BEGIN/END markers)
+  sed -i '/\[REDACTED PRIVATE KEY\]/,/\[REDACTED END KEY\]/{/\[REDACTED/!s/.*/[REDACTED]/}' "$file"
+
+  # Generic key=value patterns (manual case-insensitive via character classes)
+  local kw='[Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Pp][Ii]_[Kk][Ee][Yy]|[Aa][Pp][Ii][Kk][Ee][Yy]|[Aa][Uu][Tt][Hh]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Pp][Rr][Ii][Vv][Aa][Tt][Ee]_[Kk][Ee][Yy]|[Aa][Cc][Cc][Ee][Ss][Ss]_[Tt][Oo][Kk][Ee][Nn]|[Cc][Ll][Ii][Ee][Nn][Tt]_[Ss][Ee][Cc][Rr][Ee][Tt]|[Ss][Ii][Gg][Nn][Ii][Nn][Gg]_[Kk][Ee][Yy]'
+  # Double-quoted values (handles = and := operators)
+  sed -E -i "s/($kw)([[:space:]]*:?=[[:space:]]*)\"[^\"]{8,}\"/\1\2\"[REDACTED]\"/g" "$file"
+  # Single-quoted values
+  sed -E -i "s/($kw)([[:space:]]*:?=[[:space:]]*)'[^']{8,}'/\1\2'[REDACTED]'/g" "$file"
+  # Unquoted values
+  sed -E -i "s/($kw)([[:space:]]*:?=[[:space:]]*)[^[:space:]\"']{8,}/\1\2[REDACTED]/g" "$file"
+  # Colon-separated (key: value)
+  sed -E -i "s/($kw)([[:space:]]*:[[:space:]]+)\"[^\"]{8,}\"/\1\2\"[REDACTED]\"/g" "$file"
+  sed -E -i "s/($kw)([[:space:]]*:[[:space:]]+)[^[:space:]\"']{8,}/\1\2[REDACTED]/g" "$file"
+
+  # Apply user-defined patterns
+  if [[ -f "$custom_patterns_file" ]]; then
+    while IFS= read -r pattern; do
+      # Skip blank lines and comments
+      [[ -z "$pattern" || "$pattern" =~ ^[[:space:]]*# ]] && continue
+      sed -E -i "s/$pattern/[REDACTED]/g" "$file" 2>/dev/null || true
+    done < "$custom_patterns_file"
+  fi
+}
+
+# Check for remaining secret-like patterns; returns 1 if found
+_check_secrets() {
+  local dir="$1"
+  local found=false
+
+  local -a patterns=(
+    'AKIA[0-9A-Z]{16}'
+    'gh[pousr]_[A-Za-z0-9_]{36,}'
+    'xox[baprs]-[A-Za-z0-9-]+'
+    'eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+'
+    '-----BEGIN[A-Z ]*PRIVATE KEY-----'
+  )
+
+  for file in "$dir"/transcript.*; do
+    [[ -f "$file" ]] || continue
+    for pattern in "${patterns[@]}"; do
+      if grep -qEi "$pattern" "$file" 2>/dev/null; then
+        info "warning: potential secret found in $(basename "$file") matching: $pattern"
+        found=true
+      fi
+    done
+  done
+
+  if [[ "$found" == true ]]; then
+    info "error: secrets detected after scrubbing — aborting session creation"
+    info "hint: review transcripts or add patterns to .ai/scrub-patterns"
+    rm -rf "$dir"
+    return 1
+  fi
+  return 0
+}
+
 # Read a trailer value from git commit message
 get_trailer() {
   local commit="$1" trailer="$2"
@@ -173,11 +252,25 @@ EOF
   _install_hook "$hooks_dir/pre-push" "_hook_pre_push" \
     'ai-session _hook-pre-push "$@"'
 
+  # Create .ai/scrub-patterns with examples (if not present)
+  if [[ ! -f "$AI_DIR/scrub-patterns" ]]; then
+    cat > "$AI_DIR/scrub-patterns" << 'EOF'
+# ai-session scrub-patterns — Custom secret patterns (sed ERE syntax, one per line)
+# These are applied IN ADDITION to built-in patterns during transcript scrubbing.
+# Each pattern is used as: sed -E "s/<pattern>/[REDACTED]/g"
+#
+# Examples:
+# my-service-key-[A-Za-z0-9]{32}
+# PRIVATE-[0-9a-f]{64}
+EOF
+  fi
+
   # Add Claude Code hook to .claude/settings.json
   _install_claude_hook "$toplevel"
 
   info "ai-session: initialized in $toplevel"
   info "  .ai/ directory created"
+  info "  .ai/scrub-patterns created (add custom secret patterns)"
   info "  git hooks installed (prepare-commit-msg, post-commit, pre-push)"
   info "  Claude Code hook added to .claude/settings.json"
 }
@@ -324,6 +417,12 @@ cmd_new() {
     basename_t=$(basename "$transcript_path")
     transcript_hash="sha256:$(file_sha256 "$session_dir/$basename_t")"
   fi
+
+  # Scrub secrets from all transcript files
+  for _tf in "$session_dir"/transcript.*; do
+    [[ -f "$_tf" ]] && _scrub_secrets "$_tf"
+  done
+  _check_secrets "$session_dir" || return 1
 
   [[ -z "$author" ]] && author=$(git_author)
   [[ -z "$model" ]] && model="unknown"
