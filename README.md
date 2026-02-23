@@ -58,7 +58,7 @@ Three git hooks, one Claude Code hook. All installed with a single command.
 
 ```bash
 # Clone the repo
-git clone https://github.com/your-org/ai-session.git
+git clone https://github.com/gammons/ai-session.git
 
 # Add to PATH (pick one)
 ln -s "$PWD/ai-session/ai-session" ~/.local/bin/ai-session
