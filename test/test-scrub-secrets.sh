@@ -15,17 +15,31 @@ TEST_DIR=""
 
 setup() {
   TEST_DIR="$(mktemp -d)"
+  TEST_CACHE="$(mktemp -d)"
   cd "$TEST_DIR"
   git init -q
   git config user.name "test"
   git config user.email "test@test.com"
   git commit -q --allow-empty -m "init"
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 }
 
 teardown() {
   if [[ -n "$TEST_DIR" && -d "$TEST_DIR" ]]; then
     rm -rf "$TEST_DIR"
+  fi
+  if [[ -n "${TEST_CACHE:-}" && -d "$TEST_CACHE" ]]; then
+    rm -rf "$TEST_CACHE"
+  fi
+}
+
+# Resolve a session trailer path to an absolute path
+resolve_session() {
+  local trailer_path="$1"
+  if [[ "$trailer_path" == .ai/* ]]; then
+    echo "$TEST_DIR/$trailer_path"
+  else
+    echo "$TEST_CACHE/$trailer_path"
   fi
 }
 
@@ -33,7 +47,7 @@ teardown() {
 assert_scrubbed() {
   local name="$1" input="$2" expected="$3"
   local session_path
-  rm -rf "$TEST_DIR"/.ai/sessions/*
+  rm -rf "$TEST_CACHE"/*/sessions/*
 
   session_path=$(echo "$input" | "$AI_SESSION" new --goal "$name" --stdin 2>/dev/null) || {
     printf '  FAIL  %s (session creation failed)\n' "$name"
@@ -42,7 +56,9 @@ assert_scrubbed() {
   }
 
   local actual
-  actual="$(cat "$TEST_DIR/$session_path/transcript.md")"
+  local session_abs
+  session_abs=$(resolve_session "$session_path")
+  actual="$(cat "$session_abs/transcript.md")"
 
   if [[ "$actual" == "$expected" ]]; then
     printf '  PASS  %s\n' "$name"
@@ -58,7 +74,7 @@ assert_scrubbed() {
 # Assert session creation fails (secrets detected after scrub)
 assert_blocked() {
   local name="$1" input="$2"
-  rm -rf "$TEST_DIR"/.ai/sessions/*
+  rm -rf "$TEST_CACHE"/*/sessions/*
 
   if echo "$input" | "$AI_SESSION" new --goal "$name" --stdin >/dev/null 2>&1; then
     printf '  FAIL  %s (expected failure, got success)\n' "$name"
@@ -72,7 +88,7 @@ assert_blocked() {
 # Assert session creation succeeds and file contains no literal match
 assert_not_present() {
   local name="$1" input="$2" forbidden="$3"
-  rm -rf "$TEST_DIR"/.ai/sessions/*
+  rm -rf "$TEST_CACHE"/*/sessions/*
 
   local session_path
   session_path=$(echo "$input" | "$AI_SESSION" new --goal "$name" --stdin 2>/dev/null) || {
@@ -81,7 +97,9 @@ assert_not_present() {
     return
   }
 
-  if grep -qF -- "$forbidden" "$TEST_DIR/$session_path/transcript.md"; then
+  local session_abs
+  session_abs=$(resolve_session "$session_path")
+  if grep -qF -- "$forbidden" "$session_abs/transcript.md"; then
     printf '  FAIL  %s (found forbidden string: %s)\n' "$name" "$forbidden"
     FAIL=$((FAIL + 1))
   else
@@ -93,7 +111,7 @@ assert_not_present() {
 # Assert text survives scrubbing unchanged
 assert_preserved() {
   local name="$1" input="$2"
-  rm -rf "$TEST_DIR"/.ai/sessions/*
+  rm -rf "$TEST_CACHE"/*/sessions/*
 
   local session_path
   session_path=$(echo "$input" | "$AI_SESSION" new --goal "$name" --stdin 2>/dev/null) || {
@@ -103,7 +121,9 @@ assert_preserved() {
   }
 
   local actual
-  actual="$(cat "$TEST_DIR/$session_path/transcript.md")"
+  local session_abs
+  session_abs=$(resolve_session "$session_path")
+  actual="$(cat "$session_abs/transcript.md")"
 
   if [[ "$actual" == "$input" ]]; then
     printf '  PASS  %s\n' "$name"

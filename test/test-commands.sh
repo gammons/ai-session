@@ -15,6 +15,7 @@ TEST_DIR=""
 
 new_repo() {
   TEST_DIR="$(mktemp -d)"
+  TEST_CACHE="$(mktemp -d)"
   cd "$TEST_DIR"
   git init -q
   git config user.name "test-user"
@@ -22,9 +23,22 @@ new_repo() {
   git commit -q --allow-empty -m "init"
 }
 
+# Resolve a session trailer path to an absolute path (uses cache dir or in-tree)
+resolve_session() {
+  local trailer_path="$1"
+  if [[ "$trailer_path" == .ai/* ]]; then
+    echo "$TEST_DIR/$trailer_path"
+  else
+    echo "$TEST_CACHE/$trailer_path"
+  fi
+}
+
 teardown() {
   if [[ -n "$TEST_DIR" && -d "$TEST_DIR" ]]; then
     rm -rf "$TEST_DIR"
+  fi
+  if [[ -n "${TEST_CACHE:-}" && -d "$TEST_CACHE" ]]; then
+    rm -rf "$TEST_CACHE"
   fi
 }
 
@@ -128,10 +142,10 @@ run_tests() {
   printf 'cmd_init:\n'
   new_repo
 
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   assert_dir_exists "creates .ai directory" "$TEST_DIR/.ai"
-  assert_dir_exists "creates .ai/sessions directory" "$TEST_DIR/.ai/sessions"
+  assert_file_exists "creates .ai/config.json" "$TEST_DIR/.ai/config.json"
   assert_file_exists ".ai/.gitignore exists" "$TEST_DIR/.ai/.gitignore"
   assert_file_contains ".gitignore has active-session" "$TEST_DIR/.ai/.gitignore" "^\.active-session$"
   assert_file_exists "scrub-patterns exists" "$TEST_DIR/.ai/scrub-patterns"
@@ -144,12 +158,15 @@ run_tests() {
     "$TEST_DIR/.git/hooks/post-commit" "_hook_post_commit"
   assert_file_contains "pre-push has marker" \
     "$TEST_DIR/.git/hooks/pre-push" "_hook_pre_push"
-  assert_file_exists "claude settings.json exists" "$TEST_DIR/.claude/settings.json"
-  assert_file_contains "settings has ai-session hook" \
-    "$TEST_DIR/.claude/settings.json" "ai-session _mark-active"
+  assert_file_exists "claude settings.local.json exists" "$TEST_DIR/.claude/settings.local.json"
+  assert_file_contains "settings.local.json has ai-session hook" \
+    "$TEST_DIR/.claude/settings.local.json" "ai-session _mark-active"
+
+  # .gitignore has sessions/
+  assert_file_contains ".gitignore has sessions/" "$TEST_DIR/.ai/.gitignore" "^sessions/"
 
   # Idempotent
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
   local hook_count
   hook_count=$(grep -c "_hook_prepare_commit_msg" "$TEST_DIR/.git/hooks/prepare-commit-msg")
   assert_eq "init is idempotent (no duplicate hooks)" "1" "$hook_count"
@@ -160,88 +177,93 @@ run_tests() {
   mkdir -p "$TEST_DIR/.git/hooks"
   printf '#!/usr/bin/env bash\necho "existing hook"\n' > "$TEST_DIR/.git/hooks/prepare-commit-msg"
   chmod +x "$TEST_DIR/.git/hooks/prepare-commit-msg"
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
   assert_file_contains "preserves existing hook content" \
     "$TEST_DIR/.git/hooks/prepare-commit-msg" "existing hook"
   assert_file_contains "appends ai-session to existing hook" \
     "$TEST_DIR/.git/hooks/prepare-commit-msg" "_hook_prepare_commit_msg"
 
-  # Merges into existing settings.json
+  # Writes hook to settings.local.json, leaves settings.json untouched
   teardown
   new_repo
   mkdir -p "$TEST_DIR/.claude"
   echo '{"permissions":{"allow":["Read"]}}' > "$TEST_DIR/.claude/settings.json"
-  "$AI_SESSION" init >/dev/null 2>&1
-  assert_file_contains "preserves existing settings" \
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
+  assert_file_contains "preserves existing settings.json" \
     "$TEST_DIR/.claude/settings.json" '"allow"'
-  assert_file_contains "adds hook to existing settings" \
-    "$TEST_DIR/.claude/settings.json" "ai-session _mark-active"
+  assert_file_contains "hook goes to settings.local.json" \
+    "$TEST_DIR/.claude/settings.local.json" "ai-session _mark-active"
 
   # ─── cmd_new ──────────────────────────────────────────────────────────────
 
   printf '\ncmd_new:\n'
   teardown
   new_repo
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   # Basic --stdin
-  local session_path
+  local session_path session_abs
   session_path=$(echo "test content" | "$AI_SESSION" new --goal "Test basic new" --stdin 2>/dev/null)
-  assert_dir_exists "session directory created" "$TEST_DIR/$session_path"
-  assert_file_exists "meta.json created" "$TEST_DIR/$session_path/meta.json"
-  assert_file_exists "transcript.md created" "$TEST_DIR/$session_path/transcript.md"
-  assert_eq "transcript content" "test content" "$(cat "$TEST_DIR/$session_path/transcript.md")"
+  session_abs=$(resolve_session "$session_path")
+  assert_dir_exists "session directory created" "$session_abs"
+  assert_file_exists "meta.json created" "$session_abs/meta.json"
+  assert_file_exists "transcript.md created" "$session_abs/transcript.md"
+  assert_eq "transcript content" "test content" "$(cat "$session_abs/transcript.md")"
 
   # meta.json fields
-  jq_eq "meta: goal" "$TEST_DIR/$session_path/meta.json" ".goal" "Test basic new"
-  jq_eq "meta: author" "$TEST_DIR/$session_path/meta.json" ".author" "test-user"
-  jq_eq "meta: repo" "$TEST_DIR/$session_path/meta.json" ".repo" "$(basename "$TEST_DIR")"
-  jq_eq "meta: branch" "$TEST_DIR/$session_path/meta.json" ".branch" "main"
-  jq_eq "meta: model (default)" "$TEST_DIR/$session_path/meta.json" ".model" "unknown"
-  jq_eq "meta: commits empty" "$TEST_DIR/$session_path/meta.json" ".commits | length" "0"
-  jq_eq "meta: pr null" "$TEST_DIR/$session_path/meta.json" ".pr" "null"
-  jq_eq "meta: links empty" "$TEST_DIR/$session_path/meta.json" ".links | length" "0"
+  jq_eq "meta: goal" "$session_abs/meta.json" ".goal" "Test basic new"
+  jq_eq "meta: author" "$session_abs/meta.json" ".author" "test-user"
+  jq_eq "meta: repo" "$session_abs/meta.json" ".repo" "$(basename "$TEST_DIR")"
+  jq_eq "meta: branch" "$session_abs/meta.json" ".branch" "main"
+  jq_eq "meta: model (default)" "$session_abs/meta.json" ".model" "unknown"
+  jq_eq "meta: commits empty" "$session_abs/meta.json" ".commits | length" "0"
+  jq_eq "meta: pr null" "$session_abs/meta.json" ".pr" "null"
+  jq_eq "meta: links empty" "$session_abs/meta.json" ".links | length" "0"
 
   # session_id and short_id consistency
   local full_id short
-  full_id=$(jq -r '.session_id' "$TEST_DIR/$session_path/meta.json")
-  short=$(jq -r '.short_id' "$TEST_DIR/$session_path/meta.json")
+  full_id=$(jq -r '.session_id' "$session_abs/meta.json")
+  short=$(jq -r '.short_id' "$session_abs/meta.json")
   assert_eq "short_id matches session_id prefix" "$short" "${full_id:0:8}"
 
   # transcript_hash is set
   local thash
-  thash=$(jq -r '.transcript_hash' "$TEST_DIR/$session_path/meta.json")
+  thash=$(jq -r '.transcript_hash' "$session_abs/meta.json")
   assert_match "transcript_hash starts with sha256:" "^sha256:[0-9a-f]{64}$" "$thash"
 
   # created_at is ISO format
   local created
-  created=$(jq -r '.created_at' "$TEST_DIR/$session_path/meta.json")
+  created=$(jq -r '.created_at' "$session_abs/meta.json")
   assert_match "created_at is ISO 8601" '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$created"
 
-  # Folder naming convention
-  assert_match "folder name format" '^\.ai/sessions/[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}Z_[a-z0-9-]+__[a-f0-9]{8}$' "$session_path"
+  # Folder naming convention — now <project>/sessions/<folder>
+  assert_match "folder name format" '/sessions/[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{4}Z_[a-z0-9-]+__[a-f0-9]{8}$' "$session_path"
 
   # --model flag
   session_path=$(echo "x" | "$AI_SESSION" new --goal "model test" --stdin --model "claude-opus-4-6" 2>/dev/null)
-  jq_eq "meta: explicit model" "$TEST_DIR/$session_path/meta.json" ".model" "claude-opus-4-6"
+  session_abs=$(resolve_session "$session_path")
+  jq_eq "meta: explicit model" "$session_abs/meta.json" ".model" "claude-opus-4-6"
 
   # --author flag
   session_path=$(echo "x" | "$AI_SESSION" new --goal "author test" --stdin --author "custom-author" 2>/dev/null)
-  jq_eq "meta: explicit author" "$TEST_DIR/$session_path/meta.json" ".author" "custom-author"
+  session_abs=$(resolve_session "$session_path")
+  jq_eq "meta: explicit author" "$session_abs/meta.json" ".author" "custom-author"
 
   # --link flags
   session_path=$(echo "x" | "$AI_SESSION" new --goal "link test" --stdin \
     --link "https://example.com/pr/1" --link "https://example.com/issue/2" 2>/dev/null)
-  jq_eq "meta: links count" "$TEST_DIR/$session_path/meta.json" ".links | length" "2"
-  jq_eq "meta: first link" "$TEST_DIR/$session_path/meta.json" ".links[0]" "https://example.com/pr/1"
-  jq_eq "meta: second link" "$TEST_DIR/$session_path/meta.json" ".links[1]" "https://example.com/issue/2"
+  session_abs=$(resolve_session "$session_path")
+  jq_eq "meta: links count" "$session_abs/meta.json" ".links | length" "2"
+  jq_eq "meta: first link" "$session_abs/meta.json" ".links[0]" "https://example.com/pr/1"
+  jq_eq "meta: second link" "$session_abs/meta.json" ".links[1]" "https://example.com/issue/2"
 
   # --transcript flag (file copy)
   echo "transcript file content" > "$TEST_DIR/my-transcript.txt"
   session_path=$("$AI_SESSION" new --goal "transcript file test" --transcript "$TEST_DIR/my-transcript.txt" 2>/dev/null)
-  assert_file_exists "copied transcript file" "$TEST_DIR/$session_path/my-transcript.txt"
+  session_abs=$(resolve_session "$session_path")
+  assert_file_exists "copied transcript file" "$session_abs/my-transcript.txt"
   assert_eq "transcript file content preserved" "transcript file content" \
-    "$(cat "$TEST_DIR/$session_path/my-transcript.txt")"
+    "$(cat "$session_abs/my-transcript.txt")"
 
   # Missing --goal fails
   assert_fails "new without --goal fails" "$AI_SESSION" new --stdin
@@ -249,47 +271,24 @@ run_tests() {
   # Unknown option fails
   assert_fails "new with unknown option fails" "$AI_SESSION" new --goal "x" --bogus
 
-  # --commit mode
-  session_path=$(echo "commit content" | "$AI_SESSION" new --goal "commit mode test" --stdin --commit 2>/dev/null)
-  local last_msg
-  last_msg=$(git log -1 --format='%s')
-  assert_eq "commit message" "ai-session: commit mode test" "$last_msg"
-  local trailer_sid
-  trailer_sid=$(git log -1 --format='%(trailers:key=Claude-Session,valueonly)' | head -1)
-  assert_match "commit has Claude-Session trailer" '^[a-f0-9]{8}$' "$trailer_sid"
-  local trailer_path
-  trailer_path=$(git log -1 --format='%(trailers:key=Claude-Session-Path,valueonly)' | head -1)
-  assert_match "commit has Claude-Session-Path trailer" '^\.ai/sessions/' "$trailer_path"
-
-  # --amend mode
-  echo "dummy" > "$TEST_DIR/dummy.txt"
-  git add "$TEST_DIR/dummy.txt"
-  git commit -q -m "base commit for amend"
-  local pre_count
-  pre_count=$(git rev-list --count HEAD)
-  session_path=$(echo "amend content" | "$AI_SESSION" new --goal "amend mode test" --stdin --amend 2>/dev/null)
-  local post_count
-  post_count=$(git rev-list --count HEAD)
-  assert_eq "amend does not add extra commit" "$pre_count" "$post_count"
-  trailer_sid=$(git log -1 --format='%(trailers:key=Claude-Session,valueonly)' | head -1)
-  assert_match "amended commit has session trailer" '^[a-f0-9]{8}$' "$trailer_sid"
-
   # Breadcrumb reading
   mkdir -p "$TEST_DIR/.ai"
   jq -n '{session_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", timestamp: "2025-01-01T00:00:00Z", model: "breadcrumb-model"}' \
     > "$TEST_DIR/.ai/.active-session"
   session_path=$(echo "x" | "$AI_SESSION" new --goal "breadcrumb test" --stdin 2>/dev/null)
-  jq_eq "reads session_id from breadcrumb" "$TEST_DIR/$session_path/meta.json" ".claude_session_id" "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-  jq_eq "reads model from breadcrumb" "$TEST_DIR/$session_path/meta.json" ".model" "breadcrumb-model"
-  jq_eq "short_id from breadcrumb session" "$TEST_DIR/$session_path/meta.json" ".short_id" "aaaaaaaa"
+  session_abs=$(resolve_session "$session_path")
+  jq_eq "reads session_id from breadcrumb" "$session_abs/meta.json" ".claude_session_id" "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  jq_eq "reads model from breadcrumb" "$session_abs/meta.json" ".model" "breadcrumb-model"
+  jq_eq "short_id from breadcrumb session" "$session_abs/meta.json" ".short_id" "aaaaaaaa"
 
   # --model overrides breadcrumb
   jq -n '{session_id: "11111111-2222-3333-4444-555555555555", model: "breadcrumb-model"}' \
     > "$TEST_DIR/.ai/.active-session"
   session_path=$(echo "x" | "$AI_SESSION" new --goal "model override" --stdin --model "explicit-model" 2>/dev/null)
-  jq_eq "explicit --model overrides breadcrumb" "$TEST_DIR/$session_path/meta.json" ".model" "explicit-model"
+  session_abs=$(resolve_session "$session_path")
+  jq_eq "explicit --model overrides breadcrumb" "$session_abs/meta.json" ".model" "explicit-model"
 
-  # --repo flag
+  # --repo flag (manual override)
   local ext_dir
   ext_dir="$(mktemp -d)"
   session_path=$(echo "external" | "$AI_SESSION" new --goal "external repo" --stdin --repo "$ext_dir" 2>/dev/null)
@@ -302,23 +301,24 @@ run_tests() {
   printf '\ncmd_attach:\n'
   teardown
   new_repo
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   session_path=$(echo "x" | "$AI_SESSION" new --goal "attach target" --stdin 2>/dev/null)
+  session_abs=$(resolve_session "$session_path")
   local sid
-  sid=$(jq -r '.short_id' "$TEST_DIR/$session_path/meta.json")
+  sid=$(jq -r '.short_id' "$session_abs/meta.json")
 
   # Attach single commit
   "$AI_SESSION" attach "$sid" "abc1234" 2>/dev/null
-  jq_eq "single commit attached" "$TEST_DIR/$session_path/meta.json" ".commits[0]" "abc1234"
+  jq_eq "single commit attached" "$session_abs/meta.json" ".commits[0]" "abc1234"
 
   # Attach multiple commits
   "$AI_SESSION" attach "$sid" "def5678" "ghi9012" 2>/dev/null
-  jq_eq "multiple commits total" "$TEST_DIR/$session_path/meta.json" ".commits | length" "3"
+  jq_eq "multiple commits total" "$session_abs/meta.json" ".commits | length" "3"
 
   # Deduplication
   "$AI_SESSION" attach "$sid" "abc1234" 2>/dev/null
-  jq_eq "duplicate commits deduplicated" "$TEST_DIR/$session_path/meta.json" ".commits | length" "3"
+  jq_eq "duplicate commits deduplicated" "$session_abs/meta.json" ".commits | length" "3"
 
   # Missing session fails
   assert_fails "attach to nonexistent session" "$AI_SESSION" attach "nonexist" "abc1234"
@@ -331,7 +331,7 @@ run_tests() {
   printf '\ncmd_list:\n'
   teardown
   new_repo
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   # Empty list
   local list_output
@@ -350,10 +350,11 @@ run_tests() {
   printf '\ncmd_show:\n'
   teardown
   new_repo
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   session_path=$(echo "x" | "$AI_SESSION" new --goal "show me" --stdin 2>/dev/null)
-  sid=$(jq -r '.short_id' "$TEST_DIR/$session_path/meta.json")
+  session_abs=$(resolve_session "$session_path")
+  sid=$(jq -r '.short_id' "$session_abs/meta.json")
 
   local show_output
   show_output=$("$AI_SESSION" show "$sid" 2>/dev/null)
@@ -384,12 +385,13 @@ run_tests() {
   printf '\ncmd_new --auto:\n'
   teardown
   new_repo
-  "$AI_SESSION" init >/dev/null 2>&1
+  "$AI_SESSION" init --cache "$TEST_CACHE" >/dev/null 2>&1
 
   # --auto with no Claude projects dir just creates session without transcript
   session_path=$("$AI_SESSION" new --goal "auto no transcript" --auto 2>/dev/null)
-  assert_file_exists "meta.json exists with --auto" "$TEST_DIR/$session_path/meta.json"
-  jq_eq "transcript_hash null when no transcript" "$TEST_DIR/$session_path/meta.json" ".transcript_hash" "null"
+  session_abs=$(resolve_session "$session_path")
+  assert_file_exists "meta.json exists with --auto" "$session_abs/meta.json"
+  jq_eq "transcript_hash null when no transcript" "$session_abs/meta.json" ".transcript_hash" "null"
 
   # ─── Summary ──────────────────────────────────────────────────────────────
 

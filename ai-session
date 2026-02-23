@@ -575,7 +575,7 @@ cmd_new() {
     # Pre-init fallback: in-tree for backward compat
     base_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
     local existing_dir_intree
-    existing_dir_intree=$(find "$base_dir/$SESSIONS_DIR" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1)
+    existing_dir_intree=$(find "$base_dir/$SESSIONS_DIR" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1 || true)
     if [[ -n "$existing_dir_intree" ]]; then
       session_dir="$existing_dir_intree"
     else
@@ -586,7 +586,7 @@ cmd_new() {
   if [[ -z "${session_dir:-}" ]]; then
     # Reuse existing session folder if one with this short_id already exists
     local existing_dir
-    existing_dir=$(find "$base_dir/sessions" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1)
+    existing_dir=$(find "$base_dir/sessions" -maxdepth 1 -type d -name "*__${sid}" 2>/dev/null | head -1 || true)
     if [[ -n "$existing_dir" ]]; then
       session_dir="$existing_dir"
     else
