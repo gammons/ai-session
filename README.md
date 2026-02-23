@@ -2,7 +2,7 @@
 
 **Persist Claude Code conversation transcripts as git artifacts, linked bidirectionally to commits and PRs.**
 
-Every time you use Claude Code to write code and then `git commit`, the conversation that produced that code is automatically captured + stored right in your repo, traceable from the commit, and surfaced on your pull request.
+Every time you use Claude Code to write code and then `git commit`, the conversation that produced that code is automatically captured + stored in a local git repo at `~/.ai-sessions/<project>`, traceable from the commit, and surfaced on your pull request. Transcripts never enter your code repo — no secret scanning issues, no repo bloat.
 
 No extra steps. No copy-pasting. Just `claude`, `git commit`, `git push`.
 
@@ -10,7 +10,7 @@ No extra steps. No copy-pasting. Just `claude`, `git commit`, `git push`.
 commit a1f29c3 — Fix race condition in websocket reconnect
 
   Claude-Session: 2d8dfda4
-  Claude-Session-Path: .ai/sessions/2026-02-22_0715Z_fix-race-condition-in-websocket-reconnec__2d8dfda4
+  Claude-Session-Path: my-project/sessions/2026-02-22_0715Z_fix-race-condition-in-websocket-reconnec__2d8dfda4
 ```
 
 ## Why
@@ -37,7 +37,7 @@ When you work with Claude Code, that reasoning exists in the conversation transc
 │ git commit   │ ◀────────────────────── │ ai-session hook   │
 │              │   creates session,       │  • creates folder │
 │              │   adds trailers,         │  • copies transcript│
-│              │   stages .ai/sessions/   │  • scrubs secrets  │
+│              │   commits to cache repo  │  • scrubs secrets  │
 │              │                          │  • injects trailers│
 └──────┬──────┘                           └──────────────────┘
        │
@@ -73,23 +73,23 @@ export PATH="$PWD/ai-session:$PATH"  # add to .bashrc/.zshrc
 ```bash
 cd your-project
 ai-session init
-git add .ai .claude/settings.json
+git add .ai
 git commit -m "Set up ai-session"
 ```
 
-This creates the `.ai/` directory, installs three git hooks, and adds a Claude Code `PostToolUse` hook to `.claude/settings.json`. Committing `.ai/` and `.claude/settings.json` means teammates get the session history and the Claude Code hook config automatically.
+This creates the `.ai/` directory, installs three git hooks, adds a Claude Code `PostToolUse` hook to `.claude/settings.local.json`, and initializes a local session repo at `~/.ai-sessions/<project>`. Sessions are always stored outside your code repo — no secret scanning issues, no repo bloat. The Claude hook lives in `settings.local.json` (not `settings.json`) so it doesn't affect teammates who aren't using ai-session. Committing `.ai/` shares the git hooks and config.
 
-#### External session repository (optional)
+#### Remote session repository (optional)
 
-To keep transcripts out of your code repo, store them in a separate git repository:
+To also push sessions to a shared remote (for team visibility or backup):
 
 ```bash
 ai-session init --repo git@github.com:your-org/ai-sessions.git
-git add .ai .claude/settings.json
-git commit -m "Set up ai-session with external repo"
+git add .ai
+git commit -m "Set up ai-session with remote repo"
 ```
 
-This writes `.ai/config.json` (committed, so teammates auto-inherit the config), clones the session repo to `~/.ai-sessions/<project>`, and adds `sessions/` to `.ai/.gitignore` so transcripts never enter the code repo.
+This writes `.ai/config.json` (committed, so teammates auto-inherit the remote config). Sessions are pushed on every commit and as a catch-up during `git push`.
 
 You can override the local cache location:
 
@@ -97,7 +97,7 @@ You can override the local cache location:
 ai-session init --repo git@github.com:your-org/ai-sessions.git --cache /tmp/sessions
 ```
 
-One session repo can serve multiple code repos — sessions are namespaced by project name (the basename of your git working tree). The session repo is pushed on every commit and as a catch-up during `git push`.
+One session repo can serve multiple code repos — sessions are namespaced by project name (the basename of your git working tree).
 
 ### Use it
 
@@ -113,7 +113,7 @@ Your commit message will have trailers appended:
 
 ```
 Claude-Session: 2d8dfda4
-Claude-Session-Path: .ai/sessions/2026-02-22_0715Z_fix-race-condition__2d8dfda4
+Claude-Session-Path: my-project/sessions/2026-02-22_0715Z_fix-race-condition__2d8dfda4
 ```
 
 And your PR gets an AI Sessions table:
@@ -124,9 +124,10 @@ And your PR gets an AI Sessions table:
 
 ## What gets stored
 
-**In-tree** (default):
+Sessions are stored in a local git repo at `~/.ai-sessions/<project>/`:
+
 ```
-.ai/
+~/.ai-sessions/my-project/
   sessions/
     2026-02-22_0715Z_fix-race-condition-in-websocket-reconnec__2d8dfda4/
       meta.json            # structured metadata
@@ -134,18 +135,7 @@ And your PR gets an AI Sessions table:
       transcript.md        # human-readable markdown conversion
 ```
 
-**External repo** (with `--repo`):
-```
-# In the session repo (e.g. ~/.ai-sessions/my-project/)
-my-project/
-  sessions/
-    2026-02-22_0715Z_fix-race-condition-in-websocket-reconnec__2d8dfda4/
-      meta.json
-      transcript.jsonl
-      transcript.md
-```
-
-The `Claude-Session-Path` trailer changes accordingly — `<project>/sessions/<folder>` when external, `.ai/sessions/<folder>` when in-tree. All commands (`list`, `show`, `resume`, etc.) resolve the right location automatically via `.ai/config.json`.
+The `Claude-Session-Path` trailer uses the format `<project>/sessions/<folder>`. All commands (`list`, `show`, `resume`, etc.) resolve the location automatically via `.ai/config.json`.
 
 **`meta.json`** ties everything together:
 
@@ -170,14 +160,14 @@ The `Claude-Session-Path` trailer changes accordingly — `<project>/sessions/<f
 
 ### `ai-session init [--repo <url>] [--cache <path>]`
 
-One-time setup per repo. Creates `.ai/`, installs git hooks, configures Claude Code hook. Safe to run again — idempotent.
+One-time setup per repo. Creates `.ai/`, installs git hooks, configures Claude Code hook, and initializes a local session repo at `~/.ai-sessions/<project>`. Safe to run again — idempotent.
 
 | Flag | Description |
 |------|-------------|
-| `--repo <url>` | Store sessions in an external git repository instead of in-tree |
+| `--repo <url>` | Also push sessions to a remote git repository |
 | `--cache <path>` | Local cache base directory (default: `~/.ai-sessions`) |
 
-When `--repo` is used, `.ai/config.json` is written and committed so teammates auto-inherit the external repo config.
+`.ai/config.json` is always written and committed. When `--repo` is used, the remote URL is included so teammates auto-inherit the config.
 
 ### `ai-session list`
 
@@ -199,9 +189,6 @@ Manually create a session. Normally the git hooks handle this, but useful for ed
 # Capture current Claude session with a goal
 ai-session new --goal "Refactor database layer" --auto
 
-# Capture and immediately commit
-ai-session new --goal "Add retry logic" --auto --commit
-
 # Pipe in a transcript
 cat notes.md | ai-session new --goal "Design review" --stdin
 
@@ -220,9 +207,7 @@ ai-session new --goal "Fix auth bug" --auto \
 | `--model <name>` | Model name (auto-detected from breadcrumb/JSONL when possible) |
 | `--author <name>` | Author (default: `git config user.name`) |
 | `--link <url>` | Arbitrary URL, repeatable |
-| `--commit` | Stage + commit with trailers |
-| `--amend` | Amend last commit with trailers |
-| `--repo <path>` | Store in an external repo instead |
+| `--repo <path>` | Override session repo path |
 
 ### `ai-session attach <id> <sha>...`
 
@@ -269,13 +254,13 @@ When Claude Code edits a file (via `Edit` or `Write` tools), a `PostToolUse` hoo
 1. Uses the commit message's first line as the session goal
 2. Creates the session folder with `meta.json` and transcript files
 3. Scrubs secrets from transcripts (see [Secret scrubbing](#secret-scrubbing))
-4. **In-tree:** stages everything under `.ai/sessions/`. **External:** commits and pushes to the session repo.
+4. Commits to the local session repo (and pushes if a remote is configured)
 5. Appends `Claude-Session` and `Claude-Session-Path` trailers to the commit message
 6. Removes the breadcrumb
 
-**`post-commit`** reads the trailers from the new commit and backfills the commit SHA into `meta.json`. When using an external repo, pushes the update.
+**`post-commit`** reads the trailers from the new commit and backfills the commit SHA into `meta.json`, then commits the update to the session repo.
 
-**`pre-push`** scans outgoing commits for session trailers. If the current branch has an open PR, it auto-updates the PR body with an AI Sessions table. Also does a catch-up push to the session repo if earlier pushes failed.
+**`pre-push`** scans outgoing commits for session trailers. If the current branch has an open PR, it auto-updates the PR body with an AI Sessions table. Also does a catch-up push to the remote session repo if one is configured.
 
 If no breadcrumb exists (you're making a normal commit without Claude), all hooks silently no-op.
 
@@ -329,13 +314,13 @@ Yes. Use `ai-session new --goal "..." --transcript my-notes.md --commit` to manu
 The hooks are thin shell wrappers. You can copy the one-liner from each hook into your existing hook manager config.
 
 **How big are the transcripts?**
-Varies. A typical Claude Code session produces 10-100KB of JSONL. To keep transcripts out of your code repo entirely, use `ai-session init --repo <url>` to store them in a separate repository.
+Varies. A typical Claude Code session produces 10-100KB of JSONL. Transcripts are always stored outside your code repo in `~/.ai-sessions/<project>`, so they never affect your repo size.
 
 **What if a secret gets through the scrubber?**
 The `_check_secrets` safety net will catch high-confidence patterns (AWS keys, GitHub tokens, JWTs, private key headers) and abort the session — nothing gets committed. For other patterns, add them to `.ai/scrub-patterns`. If a secret has already been committed, rotate it immediately and use `git filter-repo` to remove it from history.
 
 **Can I strip sessions from history later?**
-Yes — they're regular files. Use `git filter-repo` or similar tools to remove `.ai/sessions/` from history if needed.
+Sessions live in a separate local repo (`~/.ai-sessions/<project>`), not in your code repo. You can simply delete or `git filter-repo` the session repo without affecting your code history.
 
 ## License
 

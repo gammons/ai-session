@@ -454,7 +454,7 @@ EOF
   info "  .ai/ directory created"
   info "  .ai/scrub-patterns created (add custom secret patterns)"
   info "  git hooks installed (prepare-commit-msg, post-commit, pre-push)"
-  info "  Claude Code hook added to .claude/settings.json"
+  info "  Claude Code hook added to .claude/settings.local.json"
 }
 
 _install_hook() {
@@ -484,22 +484,23 @@ EOF
 _install_claude_hook() {
   local toplevel="$1"
   local settings_dir="$toplevel/.claude"
-  local settings_file="$settings_dir/settings.json"
+  local settings_file="$settings_dir/settings.local.json"
 
   mkdir -p "$settings_dir"
 
-  if [[ -f "$settings_file" ]]; then
-    # Check if hook already exists
-    if jq -e '.hooks.PostToolUse[]? | .hooks[]? | select(.command == "ai-session _mark-active")' "$settings_file" &>/dev/null; then
+  # Check if hook already exists in either settings.json or settings.local.json
+  for f in "$settings_dir/settings.json" "$settings_dir/settings.local.json"; do
+    if [[ -f "$f" ]] && jq -e '.hooks.PostToolUse[]? | .hooks[]? | select(.command == "ai-session _mark-active")' "$f" &>/dev/null; then
       return 0
     fi
-    # Remove any old-format ai-session entries (flat command field, no hooks array)
+  done
+
+  if [[ -f "$settings_file" ]]; then
     local tmp
     tmp=$(mktemp)
     jq '
       .hooks //= {} |
       .hooks.PostToolUse //= [] |
-      .hooks.PostToolUse = [.hooks.PostToolUse[] | select(.command? != "ai-session _mark-active")] |
       .hooks.PostToolUse += [{"matcher": "Edit|Write|Bash|NotebookEdit", "hooks": [{"type": "command", "command": "ai-session _mark-active"}]}]
     ' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
   else
