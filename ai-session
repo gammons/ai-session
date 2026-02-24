@@ -813,12 +813,13 @@ cmd_list() {
   for meta in "$sessions_base"/*/meta.json; do
     [[ -f "$meta" ]] || continue
     found=true
-    local sid goal created model
+    local sid goal created model branch
     sid=$(jq -r '.short_id' "$meta")
     goal=$(jq -r '.goal' "$meta")
     created=$(jq -r '.created_at' "$meta")
     model=$(jq -r '.model' "$meta")
-    printf '%-10s %-20s %-20s %s\n' "$sid" "$created" "$model" "$goal"
+    branch=$(jq -r '.branch // "—"' "$meta")
+    printf '%-10s %-20s %-20s %-30s %s\n' "$sid" "$created" "$model" "$branch" "$goal"
   done
 
   if [[ "$found" == false ]]; then

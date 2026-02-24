@@ -173,8 +173,8 @@ One-time setup per repo. Creates `.ai/`, installs git hooks, configures Claude C
 
 ```
 $ ai-session list
-2d8dfda4   2026-02-22T07:15:00Z claude-opus-4-6      Fix race condition in websocket reconnect
-a9c3e1f0   2026-02-22T09:30:00Z claude-sonnet-4-6    Add unit tests for auth module
+2d8dfda4   2026-02-22T07:15:00Z claude-opus-4-6      fix/websocket-reconnect        Fix race condition in websocket reconnect
+a9c3e1f0   2026-02-22T09:30:00Z claude-sonnet-4-6    feature/auth-tests             Add unit tests for auth module
 ```
 
 ### `ai-session show <id>`
